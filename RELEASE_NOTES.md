@@ -348,6 +348,10 @@ changes (where available).
 
 ## Bug Fixes
 
+- Fixed OpenCL fast mode letting through NaN values that kernels are
+  meant to catch, and using low-precision math functions on some
+  drivers. Fast mode now keeps only the optimizations that are safe.
+
 - Fixed shift-click on the selected entry of the history stack, which
   did nothing instead of revealing that module in the right-hand panel.
 
