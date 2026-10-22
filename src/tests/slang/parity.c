@@ -265,6 +265,98 @@ static int make_tests(test_t *t)
        FLOAT("white_target", 1.0f), FLOAT("black_target", 0.0002f), FLOAT("paper_exp", 0.18f),
        FLOAT("film_fog", 0.0f), FLOAT("contrast_power", 1.5f), FLOAT("skew_power", 1.2f));
 
+  TEST("exposure", "basic", "exposure",
+       IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+       FLOAT("black", 0.01f), FLOAT("scale", 1.7f));
+
+  // camera to XYZ, camera to linear RGB and linear RGB to XYZ
+  static const float cam_to_xyz[9] = { 0.62f, 0.25f, 0.09f, 0.28f, 0.82f, -0.1f, 0.03f, -0.12f, 0.92f };
+  static const float cam_to_rgb[9] = { 1.6f, -0.45f, -0.15f, -0.2f, 1.5f, -0.3f, 0.05f, -0.5f, 1.45f };
+  static const float rgb_to_xyz[9] = { 0.4361f, 0.3851f, 0.1431f, 0.2225f, 0.7169f, 0.0606f, 0.0139f, 0.0971f, 0.7141f };
+  static const float xyz_to_rgb[9] = { 3.1339f, -1.6169f, -0.4906f, -0.9788f, 1.9161f, 0.0335f, 0.0719f, -0.2290f, 1.4052f };
+  // per channel extrapolation above 1: identity for red, curves for green and blue
+  static const float unbounded[9] = { -1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.6f, 1.0f, 1.0f, 0.6f };
+  static const float corr[4] = { 1.1f, 1.0f, 0.9f, 1.0f };
+  // a DNG hue/saturation map of 6 hues, 3 saturations and 4 values
+  enum { HUE_DIV = 6, SAT_DIV = 3, VAL_DIV = 4 };
+  static float hsm[HUE_DIV * SAT_DIV * VAL_DIV * 3];
+  for(int k = 0; k < HUE_DIV * SAT_DIV * VAL_DIV; k++)
+  {
+    hsm[3 * k + 0] = 10.0f * sinf(k);        // hue shift in degrees
+    hsm[3 * k + 1] = 1.0f + 0.1f * cosf(k);  // saturation scale
+    hsm[3 * k + 2] = 1.0f + 0.05f * sinf(2 * k); // value scale
+  }
+
+  // tone curve and blue mapping, with and without the hue/saturation map
+  // (sRGB encoded), and PQ input
+  static const char *colorin_labels[2][3] = {
+    { "colorin unbound", "colorin unbound hsm", "colorin unbound pq" },
+    { "colorin clipping", "colorin clipping hsm", "colorin clipping pq" } };
+  for(int clipping = 0; clipping < 2; clipping++)
+    for(int mode = 0; mode < 3; mode++)
+    {
+      // XYZ to Lab cancels large terms for saturated colors, as in the
+      // colorspaces tests above, and the hue/saturation map goes through Lab
+      // to ProPhoto and back once more. PQ decodes to values up to 49, which
+      // the camera matrices above would cancel down to near zero luminance,
+      // so a positive matrix stands in for them; L then reaches 375, where a
+      // and b land about 0.01 from a double precision reference, on opposite
+      // sides for OpenCL and Vulkan, as in colorspaces rgb_matrix_to_lab pq
+      TEST_TOL(colorin_labels[clipping][mode], "basic", clipping ? "colorin_clipping" : "colorin_unbound",
+           mode == 0 ? 5e-4 : mode == 1 ? 5e-3 : 0.05,
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("cmat", mode == 2 ? rgb_to_xyz : clipping ? cam_to_rgb : cam_to_xyz, sizeof(cam_to_xyz)),
+           BUFFER("lmat", rgb_to_xyz, sizeof(rgb_to_xyz)),
+           LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
+           INT("blue_mapping", mode != 2), BUFFER("a", unbounded, sizeof(unbounded)),
+           BUFFER("corr", corr, sizeof(corr)), FLOAT("scale", 1.2f),
+           INT("hue_div", HUE_DIV), INT("sat_div", SAT_DIV), INT("val_div", VAL_DIV),
+           BUFFER("dev_hsm", hsm, sizeof(hsm)), INT("encoding", 1), INT("use_hsm", mode == 1),
+           INT("hdr_transfer", mode == 2 ? 1 : 0));
+    }
+
+  TEST("colorout", "basic", "colorout",
+       IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("mat", xyz_to_rgb, sizeof(xyz_to_rgb)),
+       LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
+       BUFFER("a", unbounded, sizeof(unbounded)), INT("hdr_transfer", 0));
+  // the steep part of the PQ curve, as for colorspaces lab_to_rgb_matrix pq
+  TEST_TOL("colorout pq", "basic", "colorout", 5e-4,
+       IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+       BUFFER("mat", xyz_to_rgb, sizeof(xyz_to_rgb)),
+       LUT("lutr", lut_curve, 256, 256), LUT("lutg", lut_curve, 256, 256), LUT("lutb", lut_curve, 256, 256),
+       BUFFER("a", unbounded, sizeof(unbounded)), INT("hdr_transfer", 1));
+
+  // 4x4 matrices as the host passes them, of which the kernels read 3 rows
+  static const float cm_rgb_to_xyz[12] = { 0.4361f, 0.3851f, 0.1431f, 0.0f, 0.2225f, 0.7169f, 0.0606f, 0.0f,
+                                           0.0139f, 0.0971f, 0.7141f, 0.0f };
+  static const float cm_xyz_to_rgb[12] = { 3.1339f, -1.6169f, -0.4906f, 0.0f, -0.9788f, 1.9161f, 0.0335f, 0.0f,
+                                           0.0719f, -0.2290f, 1.4052f, 0.0f };
+  static const float cm_mix[12] = { 1.05f, -0.03f, -0.02f, 0.0f, -0.04f, 1.06f, -0.02f, 0.0f,
+                                    0.01f, -0.06f, 1.05f, 0.0f };
+  static const char *cm_kernels[5] = { "channelmixerrgb_CAT16", "channelmixerrgb_bradford_linear",
+                                       "channelmixerrgb_bradford_full", "channelmixerrgb_XYZ",
+                                       "channelmixerrgb_RGB" };
+  static char cm_labels[5][3][96];
+  for(int k = 0; k < 5; k++)
+    for(int mode = 0; mode < 3; mode++)
+    {
+      // version 3 with gamut compression and clipping; version 1 unclipped;
+      // version 2 to monochrome
+      static const char *cm_suffix[3] = { "v3 clip", "v1", "v2 grey" };
+      snprintf(cm_labels[k][mode], sizeof(cm_labels[k][mode]), "%s %s", cm_kernels[k], cm_suffix[mode]);
+      // unclipped, out of gamut inputs come out between about -1e3 and 1e6,
+      // where Metal lands up to 2.5e-4 (relative) from OpenCL
+      TEST_TOL(cm_labels[k][mode], "channelmixer", cm_kernels[k], mode == 1 ? 1e-3 : 0.0,
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+           BUFFER("RGB_to_XYZ", cm_rgb_to_xyz, sizeof(cm_rgb_to_xyz)),
+           BUFFER("XYZ_to_RGB", cm_xyz_to_rgb, sizeof(cm_xyz_to_rgb)), BUFFER("MIX", cm_mix, sizeof(cm_mix)),
+           FLOAT4("illuminant", 0.97f, 1.01f, 0.78f, 0.0f), FLOAT4("saturation", 0.1f, -0.05f, 0.08f, 0.0f),
+           FLOAT4("lightness", 0.02f, 0.05f, -0.03f, 0.0f), FLOAT4("grey", 0.3f, 0.6f, 0.1f, 0.0f),
+           FLOAT("p", 1.02f), FLOAT("gamut", mode == 0 ? 0.5f : 0.0f), INT("clip", mode == 0),
+           INT("apply_grey", mode == 2), INT("version", mode == 0 ? 2 : mode == 1 ? 0 : 1));
+    }
+
 #undef TEST
 #undef TEST_TOL
   return n;
