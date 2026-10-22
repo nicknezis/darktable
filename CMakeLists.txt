@@ -335,6 +335,16 @@ elseif(USE_OPENCL)
   message(STATUS "Test-compilation of OpenCL programs is disabled.")
 endif()
 
+if(USE_SLANG)
+  find_program(SLANGC_EXECUTABLE slangc)
+  if(SLANGC_EXECUTABLE)
+    message(STATUS "Found slangc - ${SLANGC_EXECUTABLE}")
+  else()
+    message(WARNING "slangc not found, the Slang kernels will not be compiled")
+    set(USE_SLANG OFF)
+  endif()
+endif()
+
 # we need jsonschema to check noiseprofiles.json
 find_program(jsonschema_BIN jsonschema)
 if(${jsonschema_BIN} STREQUAL "jsonschema_BIN-NOTFOUND")
