@@ -345,6 +345,20 @@ if(USE_SLANG)
   endif()
 endif()
 
+# slangc hands .metallib builds to Apple's metal compiler, which ships with
+# Xcode but not with the Command Line Tools. Probed here because both
+# data/kernels/slang and src need to know.
+set(DT_SLANG_METALLIB OFF)
+if(USE_SLANG AND APPLE)
+  execute_process(COMMAND xcrun -sdk macosx -f metal
+                  RESULT_VARIABLE XCRUN_METAL_RESULT OUTPUT_QUIET ERROR_QUIET)
+  if(XCRUN_METAL_RESULT EQUAL 0)
+    set(DT_SLANG_METALLIB ON)
+  else()
+    message(STATUS "Metal compiler not found (needs Xcode), Slang kernels are translated to Metal source only")
+  endif()
+endif()
+
 # we need jsonschema to check noiseprofiles.json
 find_program(jsonschema_BIN jsonschema)
 if(${jsonschema_BIN} STREQUAL "jsonschema_BIN-NOTFOUND")
