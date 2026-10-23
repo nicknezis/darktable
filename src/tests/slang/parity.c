@@ -1656,11 +1656,10 @@ static int make_tests(test_t *t)
          IMG_IN("coarse", dp_pre), IMG_IN("detail", dp_detail), IMG_OUT("out"), INT("width", W), INT("height", H),
          FLOAT4("threshold", 0.1f, 0.05f, 0.15f, 0.0f), FLOAT4("boost", 1.0f, 1.0f, 1.0f, 1.0f));
 
-    // block sums of the squared detail. The OpenCL kernel adds up each
-    // block as a tree, the Slang one in rows, so they differ in the last bits
+    // block sums of the squared detail, a work group per block on both
     enum { DP_NBX = (W + 15) / 16, DP_NBY = (H + 15) / 16 };
     TEST_GRID("denoiseprofile_reduce_first", "denoiseprofile", "denoiseprofile_reduce_first", 1e-5,
-              DP_NBX, DP_NBY,
+              DP_NBX * 16, DP_NBY * 16,
               IMG_IN("in", dp_detail), INT("width", W), INT("height", H),
               BUFFER_OUT("accu", NULL, sizeof(float) * 4 * DP_NBX * DP_NBY), LOCAL("buffer", sizeof(float) * 4 * 256));
     t[n - 1].clgw = DP_NBX * 16;

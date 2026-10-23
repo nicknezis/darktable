@@ -2887,7 +2887,7 @@ static int process_wavelets_slang(dt_iop_module_t *self,
     const float sigma_band = powf(varf, s) * sigma;
 
     // determine thrs as bayesshrink
-    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx, nby,
+    err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_reduce_first", nbx * 16, nby * 16,
                                    SLIMG_DEV(dev_detail[s]), SLARG(width), SLARG(height), SLBUF_DEV(dev_m));
     if(!err) err = dt_slang_gpu_buffer_read(dev_m, sumsum, sizeof(float) * 4 * bufsize);
     if(err) goto error;

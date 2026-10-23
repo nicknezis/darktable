@@ -394,7 +394,8 @@ void denoiseprofile_decompose(uint3 gid : SV_DispatchThreadID,
       const int yy = mult * (j - 2) + y;
       const int k = j * 5 + i;
 
-      const float4 px = in.readpixel(xx, yy);
+      // readpixel()'s clamp, without its texture size query in this hot loop
+      const float4 px = in.readA(clamp(int2(xx, yy), int2(0), int2(width - 1, height - 1)));
       const float4 w = filter[k] * weight(pixel, px, inv_sigma2);
 
       sum += w * px;
@@ -427,34 +428,44 @@ void denoiseprofile_synthesize(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), sum);
 }
 
-// the sum of the squared pixels in each 16x16 block, one work item per
-// block, where the OpenCL kernel runs a work group per block
+// the sum of the squared pixels in each 16x16 block, one work group per
+// block as in the OpenCL kernel: a lone work item per block took 2.6 ms
+// per scale on an M4 Pro. This relies on the 16x16 group shape, which
+// slang_gpu_metal.m only shrinks for kernels that cannot run 256 threads
 static const int REDUCE_BLOCK = 16;
+groupshared float4 reduce_buffer[REDUCE_BLOCK * REDUCE_BLOCK];
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void denoiseprofile_reduce_first(uint3 gid : SV_DispatchThreadID,
+                                 uint3 lid : SV_GroupThreadID,
+                                 uint3 grp : SV_GroupID,
                                  uniform ImageIn in, uniform int width, uniform int height,
                                  uniform RWStructuredBuffer<float4> accu)
 {
-  const int bx = gid.x;
-  const int by = gid.y;
-  const int nbx = (width + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
-  const int nby = (height + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
-  if(bx >= nbx || by >= nby) return;
+  const int x = gid.x;
+  const int y = gid.y;
+  const int l = lid.y * REDUCE_BLOCK + lid.x;
 
+  // no early return: every item of the group has to reach the barriers
   float4 sum = float4(0.0f);
-  for(int j = 0; j < REDUCE_BLOCK; j++)
+  if(x < width && y < height)
   {
-    const int y = by * REDUCE_BLOCK + j;
-    if(y >= height) break;
-    for(int i = 0; i < REDUCE_BLOCK; i++)
-    {
-      const int x = bx * REDUCE_BLOCK + i;
-      if(x >= width) break;
-      const float4 pixel = in.readpixel(x, y);
-      sum += pixel * pixel;
-    }
+    const float4 pixel = in.readpixel(x, y);
+    sum = pixel * pixel;
   }
-  accu[by * nbx + bx] = sum;
+  reduce_buffer[l] = sum;
+  GroupMemoryBarrierWithGroupSync();
+
+  for(int offset = REDUCE_BLOCK * REDUCE_BLOCK / 2; offset > 0; offset >>= 1)
+  {
+    if(l < offset) reduce_buffer[l] += reduce_buffer[l + offset];
+    GroupMemoryBarrierWithGroupSync();
+  }
+
+  if(l == 0)
+  {
+    const int nbx = (width + REDUCE_BLOCK - 1) / REDUCE_BLOCK;
+    accu[grp.y * nbx + grp.x] = reduce_buffer[0];
+  }
 }
