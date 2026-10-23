@@ -55,6 +55,7 @@ typedef enum arg_kind_t
   ARG_BUFFER,
   ARG_BUFFER_OUT, // read and written by the kernel, and compared
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
+  ARG_RAW_U16,    // uint16 raw data: an unsigned integer image in OpenCL, a buffer of value pairs in Slang
 } arg_kind_t;
 
 typedef struct arg_t
@@ -207,6 +208,8 @@ static void make_inputs(void)
 #define STRUCT(n, ptr) { .kind = ARG_STRUCT, .name = n, .data = &(ptr), .size = sizeof(ptr) }
 #define FLOAT2(n, a, b) { .kind = ARG_FLOAT2, .name = n, .v = { a, b } }
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
+#define RAW_U16(n, ptr, rw, rh) { .kind = ARG_RAW_U16, .name = n, .data = ptr, .w = rw, .h = rh, \
+                                  .size = (size_t)(rw) * (rh) * sizeof(uint16_t) }
 
 static const float levels[9] = { 0.05f, 0.45f, 0.9f, 0.0f, 0.5f, 1.0f, 0.1f, 0.4f, 0.95f };
 static const float inv_gamma[3] = { 1.1f, 0.9f, 1.3f };
@@ -217,6 +220,9 @@ static const float matrix3x3[9] = { 0.9f, 0.05f, 0.05f, 0.1f, 0.8f, 0.1f, 0.0f, 
 static int make_tests(test_t *t)
 {
   int n = 0;
+  // an X-Trans pattern as the host passes it: 6x6 bytes
+  static const uint8_t xtrans6[6][6] = { { 1, 1, 0, 1, 1, 2 }, { 1, 1, 2, 1, 1, 0 }, { 2, 0, 1, 0, 2, 1 },
+                                         { 1, 1, 2, 1, 1, 0 }, { 1, 1, 0, 1, 1, 2 }, { 0, 2, 1, 2, 0, 1 } };
 #define TEST_GRID(lbl, prog, kern, tol, w, h, ...)                                        \
   {                                                                                      \
     const arg_t a[] = { __VA_ARGS__ };                                                   \
@@ -224,6 +230,15 @@ static int make_tests(test_t *t)
                      .gw = w, .gh = h, .nargs = sizeof(a) / sizeof(a[0]) };             \
     memcpy(t[n].args, a, sizeof(a));                                                     \
     n++;                                                                                 \
+  }
+// a line kernel runs one work item per row or column, laid out 16 wide on
+// the Slang side (see dt_slang_gpu_run_1d_args) and as len x 1 in OpenCL
+#define TEST_LINE(lbl, prog, kern, tol, len, ...)                                         \
+  {                                                                                      \
+    TEST_GRID(lbl, prog, kern, tol, 16, ((len) + 15) / 16, __VA_ARGS__);                 \
+    t[n - 1].clgw = (len);                                                               \
+    t[n - 1].clgh = 1;                                                                   \
+    t[n - 1].clly = 1;                                                                   \
   }
 #define TEST_TOL(lbl, prog, kern, tol, ...) TEST_GRID(lbl, prog, kern, tol, W, H, __VA_ARGS__)
 #define TEST(lbl, prog, kern, ...) TEST_TOL(lbl, prog, kern, 0.0, __VA_ARGS__)
@@ -300,6 +315,69 @@ static int make_tests(test_t *t)
 
   TEST("colorspaces gamma", "colorspaces", "colorspaces_transform_gamma",
        IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), FLOAT("gamma", 0.45f));
+
+  // the clipping indicators. tmp stands for the input in the histogram
+  // profile, with values on both sides of the thresholds
+  static float *ox_tmp = NULL;
+  if(!ox_tmp)
+  {
+    ox_tmp = malloc(sizeof(float) * 4 * W * H);
+    for(size_t k = 0; k < (size_t)4 * W * H; k++) ox_tmp[k] = image_in[(k * 7) % ((size_t)4 * W * H)] * 1.05f;
+  }
+  static const char *ox_labels[5] = { "overexposed gamut", "overexposed anyrgb", "overexposed luminance",
+                                      "overexposed saturation", "overexposed no profile" };
+  for(int m = 0; m < 5; m++)
+    TEST(ox_labels[m], "basic", "overexposed",
+         IMG_IN("in", image_in), IMG_OUT("out"), IMG_IN("tmp", ox_tmp), INT("width", W), INT("height", H),
+         FLOAT("lower", 0.0625f), FLOAT("upper", 0.95f),
+         FLOAT4("lower_color", 0.0f, 0.0f, 1.0f, 1.0f), FLOAT4("upper_color", 1.0f, 0.0f, 0.0f, 1.0f),
+         BUFFER("profile_info", &profile_nonlinear, sizeof(profile_info_t)), LUT("lut", lut_profile, 256, 256 * 6),
+         INT("use_work_profile", m < 4), INT("mode", m < 4 ? m : 0));
+
+  // raw overexposed: output pixel coordinates mapped back into a raw of a
+  // different size, partly outside of it, with fractional positions
+  enum { RW = 300, RH = 200 };
+  static uint16_t *ro_raw = NULL;
+  static float *ro_coord = NULL;
+  if(!ro_raw)
+  {
+    ro_raw = malloc(sizeof(uint16_t) * RW * RH);
+    for(size_t k = 0; k < (size_t)RW * RH; k++) ro_raw[k] = (uint16_t)(frand() * 65535.0f);
+    ro_coord = malloc(sizeof(float) * 2 * W * H);
+    for(int y = 0; y < H; y++)
+      for(int x = 0; x < W; x++)
+      {
+        ro_coord[2 * ((size_t)y * W + x)] = x * 0.61f - 10.3f;
+        ro_coord[2 * ((size_t)y * W + x) + 1] = y * 0.83f - 7.6f;
+      }
+  }
+  static const unsigned int ro_threshold[4] = { 40000, 45000, 50000, 45000 };
+  static const float ro_colors[4][4] = { { 1.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f, 1.0f },
+                                         { 0.0f, 0.0f, 1.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 1.0f } };
+  static const unsigned int ro_filters[2] = { 0x94949494u, 9u };
+  static char ro_labels[2][3][48];
+  for(int f = 0; f < 2; f++)
+  {
+    const char *cfa = f ? "xtrans" : "bayer";
+    snprintf(ro_labels[f][0], sizeof(ro_labels[f][0]), "rawoverexposed_mark_cfa %s", cfa);
+    snprintf(ro_labels[f][1], sizeof(ro_labels[f][1]), "rawoverexposed_mark_solid %s", cfa);
+    snprintf(ro_labels[f][2], sizeof(ro_labels[f][2]), "rawoverexposed_falsecolor %s", cfa);
+    TEST(ro_labels[f][0], "basic", "rawoverexposed_mark_cfa",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("pi", ro_coord, sizeof(float) * 2 * W * H),
+         INT("width", W), INT("height", H), RAW_U16("raw", ro_raw, RW, RH), INT("raw_width", RW),
+         INT("raw_height", RH), INT("filters", ro_filters[f]), BUFFER("xtrans", xtrans6, sizeof(xtrans6)),
+         BUFFER("threshold", ro_threshold, sizeof(ro_threshold)), BUFFER("colors", ro_colors, sizeof(ro_colors)));
+    TEST(ro_labels[f][1], "basic", "rawoverexposed_mark_solid",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("pi", ro_coord, sizeof(float) * 2 * W * H),
+         INT("width", W), INT("height", H), RAW_U16("raw", ro_raw, RW, RH), INT("raw_width", RW),
+         INT("raw_height", RH), INT("filters", ro_filters[f]), BUFFER("xtrans", xtrans6, sizeof(xtrans6)),
+         BUFFER("threshold", ro_threshold, sizeof(ro_threshold)), FLOAT4("solid_color", 0.0f, 0.0f, 0.0f, 1.0f));
+    TEST(ro_labels[f][2], "basic", "rawoverexposed_falsecolor",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("pi", ro_coord, sizeof(float) * 2 * W * H),
+         INT("width", W), INT("height", H), RAW_U16("raw", ro_raw, RW, RH), INT("raw_width", RW),
+         INT("raw_height", RH), INT("filters", ro_filters[f]), BUFFER("xtrans", xtrans6, sizeof(xtrans6)),
+         BUFFER("threshold", ro_threshold, sizeof(ro_threshold)));
+  }
 
   // 4x4 matrices as the host passes them, of which the kernel reads 3 rows
   static const float to_base[16] = { 0.95f, 0.03f, 0.02f, 0.0f, 0.04f, 0.92f, 0.04f, 0.0f, 0.01f, 0.05f, 0.94f, 0.0f };
@@ -447,7 +525,7 @@ static int make_tests(test_t *t)
          RAW_IN("in", image_raw), BYTES_OUT("inmask", 3 * msize), INT("msize", msize), INT("mwidth", mwidth),
          INT("mheight", mheight), INT("iwidth", W), INT("iheight", H), INT("filters", bayer[b]),
          BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("clips", hl_clips, sizeof(hl_clips)));
-    TEST_GRID(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H, 1,
+    TEST_LINE(bayer_labels[b][3], "basic", "highlights_chroma", 0.0, H,
          RAW_IN("in", image_raw), BUFFER("mask", mask_bytes, 3 * msize + 64),
          BUFFER_OUT("accu", NULL, sizeof(float) * 8 * H), INT("width", W), INT("height", H),
          INT("msize", msize), INT("mwidth", mwidth), INT("filters", bayer[b]),
@@ -953,7 +1031,7 @@ static int make_tests(test_t *t)
     const float k = (1.0f - ema) * (1.0f - ema) / (1.0f + (2.0f * alpha * ema) - ema2);
     const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
     const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
-    TEST_GRID("gaussian_column_1c", "gaussian", "gaussian_column_1c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_1c", "gaussian", "gaussian_column_1c", 1e-6, W,
               BUFFER("in", image_raw, plane), BUFFER_OUT("out", NULL, plane), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT("Labmax", 1.0f), FLOAT("Labmin", 0.0f));
@@ -986,13 +1064,13 @@ static int make_tests(test_t *t)
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in),
               GF_OUT("out_r"), GF_OUT("out_g"), GF_OUT("out_b"), FLOAT("guide_weight", 10.0f));
     // a narrow window, and one wider than half the image
-    TEST_GRID("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+    TEST_LINE("guided_filter_box_mean_x w7", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_GRID("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH, 1,
+    TEST_LINE("guided_filter_box_mean_x w300", "guided_filter", "guided_filter_box_mean_x", 1e-6, GH,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 300));
-    TEST_GRID("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+    TEST_LINE("guided_filter_box_mean_y w7", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 7));
-    TEST_GRID("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W, 1,
+    TEST_LINE("guided_filter_box_mean_y w150", "guided_filter", "guided_filter_box_mean_y", 1e-6, W,
               INT("width", W), INT("height", GH), GF_IN("in", rcd_dir), GF_OUT("out"), INT("w", 150));
     TEST_GRID("guided_filter_covariances", "guided_filter", "guided_filter_covariances", 0.0, W, GH,
               INT("width", W), INT("height", GH), INT("first", 2), IMG_IN("guide", image_in), GF_IN("img", rcd_dir),
@@ -1143,12 +1221,12 @@ static int make_tests(test_t *t)
     const float a0 = k, a1 = k * (alpha - 1.0f) * ema, a2 = k * (alpha + 1.0f) * ema, a3 = -k * ema2;
     const float coefp = (a0 + a1) / (1.0f + b1 + b2), coefn = (a2 + a3) / (1.0f + b1 + b2);
     const size_t plane2 = 2 * sizeof(float) * W * H, plane4 = 4 * sizeof(float) * W * H;
-    TEST_GRID("gaussian_column_2c", "gaussian", "gaussian_column_2c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_2c", "gaussian", "gaussian_column_2c", 1e-6, W,
               BUFFER("in", image_in, plane2), BUFFER_OUT("out", NULL, plane2), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT2("Labmax", 1.0f, 1.0f),
               FLOAT2("Labmin", 0.0f, 0.0f));
-    TEST_GRID("gaussian_column_4c", "gaussian", "gaussian_column_4c", 1e-6, W, 1,
+    TEST_LINE("gaussian_column_4c", "gaussian", "gaussian_column_4c", 1e-6, W,
               BUFFER("in", image_in, plane4), BUFFER_OUT("out", NULL, plane4), INT("width", W), INT("height", H),
               FLOAT("a0", a0), FLOAT("a1", a1), FLOAT("a2", a2), FLOAT("a3", a3), FLOAT("b1", b1), FLOAT("b2", b2),
               FLOAT("coefp", coefp), FLOAT("coefn", coefn), FLOAT4("Labmax", 1.0f, 1.0f, 1.0f, 1.0f),
@@ -1280,7 +1358,7 @@ static int make_tests(test_t *t)
            CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
            FLOAT("sat_shift", 0.1f), FLOAT("white", 1.2f), INT("mode", ce_modes[m]), INT("width", W),
            INT("height", H));
-    TEST_GRID("draw_weight", "colorequal", "draw_weight", 0.0, W, 1,
+    TEST_LINE("draw_weight", "colorequal", "draw_weight", 0.0, W,
               IMG_OUT("dev_out"), CE_BUF("weights", ce_weights, sizeof(ce_weights)), FLOAT("bright_shift", -0.1f),
               FLOAT("sat_shift", 0.1f), INT("mode", 6), INT("width", W), INT("height", H));
     for(int guiding = 0; guiding < 2; guiding++)
@@ -1362,7 +1440,7 @@ static int make_tests(test_t *t)
         snprintf(te_box[r][b], sizeof(te_box[r][b]), "%s r%d", te_box_kernels[b], te_radius[r]);
         const int is_y = b & 1;
         const size_t sz = b < 2 ? s2 : s4;
-        TEST_GRID(te_box[r][b], "toneequal", te_box_kernels[b], 1e-5, is_y ? W : H, 1,
+        TEST_LINE(te_box[r][b], "toneequal", te_box_kernels[b], 1e-5, is_y ? W : H,
                   BUFFER("input", b < 2 ? te_ab : te_packed, sz), BUFFER_OUT("output", NULL, sz),
                   INT("width", W), INT("height", H), INT("radius", te_radius[r]));
       }
@@ -1726,6 +1804,14 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
       case ARG_LOCAL:
         CK(clSetKernelArg(k, a, arg->size, NULL));
         break;
+      case ARG_RAW_U16:
+      {
+        const cl_image_format ufmt = { CL_R, CL_UNSIGNED_INT16 };
+        mem[a] = clCreateImage(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, &ufmt, &desc, (void *)arg->data, &err);
+        CK(err);
+        CK(clSetKernelArg(k, a, sizeof(cl_mem), &mem[a]));
+        break;
+      }
       case ARG_BUFFER:
         mem[a] = clCreateBuffer(e->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, arg->size, (void *)arg->data, &err);
         CK(err);
@@ -2117,9 +2203,10 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
         break;
       case ARG_BUFFER:
       case ARG_BUFFER_OUT:
+      case ARG_RAW_U16:
         buf[a] = vk_buffer(e, arg->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         have_buf[a] = 1;
-        memcpy(buf[a].map, arg->kind == ARG_BUFFER ? arg->data : initial_data(arg), arg->size);
+        memcpy(buf[a].map, arg->kind == ARG_BUFFER_OUT ? initial_data(arg) : arg->data, arg->size);
         lb[nbind] = (VkDescriptorSetLayoutBinding){ p->binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                                     VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         dbi[nbind] = (VkDescriptorBufferInfo){ buf[a].buf, 0, arg->size };
