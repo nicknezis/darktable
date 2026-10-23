@@ -71,18 +71,29 @@ void gaussian_column_1c(uint3 gid : SV_DispatchThreadID,
   }
 }
 
-// the OpenCL kernel stages blocks in local memory to coalesce its writes;
-// this one transposes directly
+// a 16x16 work group stages its block in group shared memory, as the
+// OpenCL kernel does, so that the writes are coalesced too; writing
+// straight to the transposed position scatters them a row apart. The
+// extra column keeps the transposed reads off a single memory bank
+groupshared float transpose_block_1c[16][17];
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void gaussian_transpose_1c(uint3 gid : SV_DispatchThreadID,
+                           uint3 lid : SV_GroupThreadID,
+                           uint3 grp : SV_GroupID,
                            uniform StructuredBuffer<float> in, uniform RWStructuredBuffer<float> out,
                            uniform int width, uniform int height)
 {
   const int x = gid.x;
   const int y = gid.y;
-  if(x >= width || y >= height) return;
-  out[x * height + y] = in[y * width + x];
+  if(x < width && y < height) transpose_block_1c[lid.y][lid.x] = in[y * width + x];
+  GroupMemoryBarrierWithGroupSync();
+
+  // this item writes the transposed block's row lid.y, column lid.x
+  const int ox = grp.y * 16 + lid.x;
+  const int oy = grp.x * 16 + lid.y;
+  if(ox < height && oy < width) out[oy * height + ox] = transpose_block_1c[lid.x][lid.y];
 }
 
 [shader("compute")]
@@ -179,28 +190,46 @@ void gaussian_column_4c(uint3 gid : SV_DispatchThreadID,
   }
 }
 
+groupshared float2 transpose_block_2c[16][17];
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void gaussian_transpose_2c(uint3 gid : SV_DispatchThreadID,
+                           uint3 lid : SV_GroupThreadID,
+                           uint3 grp : SV_GroupID,
                            uniform StructuredBuffer<float2> in, uniform RWStructuredBuffer<float2> out,
                            uniform int width, uniform int height)
 {
   const int x = gid.x;
   const int y = gid.y;
-  if(x >= width || y >= height) return;
-  out[x * height + y] = in[y * width + x];
+  if(x < width && y < height) transpose_block_2c[lid.y][lid.x] = in[y * width + x];
+  GroupMemoryBarrierWithGroupSync();
+
+  // this item writes the transposed block's row lid.y, column lid.x
+  const int ox = grp.y * 16 + lid.x;
+  const int oy = grp.x * 16 + lid.y;
+  if(ox < height && oy < width) out[oy * height + ox] = transpose_block_2c[lid.x][lid.y];
 }
+
+groupshared float4 transpose_block_4c[16][17];
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void gaussian_transpose_4c(uint3 gid : SV_DispatchThreadID,
+                           uint3 lid : SV_GroupThreadID,
+                           uint3 grp : SV_GroupID,
                            uniform StructuredBuffer<float4> in, uniform RWStructuredBuffer<float4> out,
                            uniform int width, uniform int height)
 {
   const int x = gid.x;
   const int y = gid.y;
-  if(x >= width || y >= height) return;
-  out[x * height + y] = in[y * width + x];
+  if(x < width && y < height) transpose_block_4c[lid.y][lid.x] = in[y * width + x];
+  GroupMemoryBarrierWithGroupSync();
+
+  // this item writes the transposed block's row lid.y, column lid.x
+  const int ox = grp.y * 16 + lid.x;
+  const int oy = grp.x * 16 + lid.y;
+  if(ox < height && oy < width) out[oy * height + ox] = transpose_block_4c[lid.x][lid.y];
 }
 
 // the OpenCL host code copies between image and buffer with
