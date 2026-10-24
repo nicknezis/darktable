@@ -57,6 +57,7 @@ typedef enum arg_kind_t
   ARG_LOCAL,      // OpenCL local memory, which the Slang kernels do without
   ARG_RAW_U16,    // uint16 raw data: an unsigned integer image in OpenCL, a buffer of value pairs in Slang
   ARG_FLOAT4_BUF, // a float4 value in OpenCL, a buffer holding it in Slang
+  ARG_CHAR2,      // a char2 in OpenCL, an int2 in Slang
 } arg_kind_t;
 
 typedef struct arg_t
@@ -194,6 +195,155 @@ static void make_inputs(void)
   profile_pq.hdr_transfer = 1; // DT_HDR_PQ
 }
 
+// the VNG tables as _vng_gpu_tables() in src/iop/demosaicing/vng.c builds
+// them, for one Bayer pattern or the X-Trans one
+static const signed char vng_terms[]
+      = { -2, -2, +0, -1, 1, 0x01, -2, -2, +0, +0, 2, 0x01, -2, -1, -1, +0, 1, 0x01, -2, -1, +0, -1, 1, 0x02,
+          -2, -1, +0, +0, 1, 0x03, -2, -1, +0, +1, 2, 0x01, -2, +0, +0, -1, 1, 0x06, -2, +0, +0, +0, 2, 0x02,
+          -2, +0, +0, +1, 1, 0x03, -2, +1, -1, +0, 1, 0x04, -2, +1, +0, -1, 2, 0x04, -2, +1, +0, +0, 1, 0x06,
+          -2, +1, +0, +1, 1, 0x02, -2, +2, +0, +0, 2, 0x04, -2, +2, +0, +1, 1, 0x04, -1, -2, -1, +0, 1, 0x80,
+          -1, -2, +0, -1, 1, 0x01, -1, -2, +1, -1, 1, 0x01, -1, -2, +1, +0, 2, 0x01, -1, -1, -1, +1, 1, 0x88,
+          -1, -1, +1, -2, 1, 0x40, -1, -1, +1, -1, 1, 0x22, -1, -1, +1, +0, 1, 0x33, -1, -1, +1, +1, 2, 0x11,
+          -1, +0, -1, +2, 1, 0x08, -1, +0, +0, -1, 1, 0x44, -1, +0, +0, +1, 1, 0x11, -1, +0, +1, -2, 2, 0x40,
+          -1, +0, +1, -1, 1, 0x66, -1, +0, +1, +0, 2, 0x22, -1, +0, +1, +1, 1, 0x33, -1, +0, +1, +2, 2, 0x10,
+          -1, +1, +1, -1, 2, 0x44, -1, +1, +1, +0, 1, 0x66, -1, +1, +1, +1, 1, 0x22, -1, +1, +1, +2, 1, 0x10,
+          -1, +2, +0, +1, 1, 0x04, -1, +2, +1, +0, 2, 0x04, -1, +2, +1, +1, 1, 0x04, +0, -2, +0, +0, 2, 0x80,
+          +0, -1, +0, +1, 2, 0x88, +0, -1, +1, -2, 1, 0x40, +0, -1, +1, +0, 1, 0x11, +0, -1, +2, -2, 1, 0x40,
+          +0, -1, +2, -1, 1, 0x20, +0, -1, +2, +0, 1, 0x30, +0, -1, +2, +1, 2, 0x10, +0, +0, +0, +2, 2, 0x08,
+          +0, +0, +2, -2, 2, 0x40, +0, +0, +2, -1, 1, 0x60, +0, +0, +2, +0, 2, 0x20, +0, +0, +2, +1, 1, 0x30,
+          +0, +0, +2, +2, 2, 0x10, +0, +1, +1, +0, 1, 0x44, +0, +1, +1, +2, 1, 0x10, +0, +1, +2, -1, 2, 0x40,
+          +0, +1, +2, +0, 1, 0x60, +0, +1, +2, +1, 1, 0x20, +0, +1, +2, +2, 1, 0x10, +1, -2, +1, +0, 1, 0x80,
+          +1, -1, +1, +1, 1, 0x88, +1, +0, +1, +2, 1, 0x08, +1, +0, +2, -1, 1, 0x40, +1, +0, +2, +1, 1, 0x10 };
+static const signed char vng_chood[] = { -1, -1, -1, 0, -1, +1, 0, +1, +1, +1, +1, 0, +1, -1, 0, -1 };
+
+static int fcol(const int row, const int col, const uint32_t filters, const uint8_t (*const xtrans)[6])
+{
+  if(filters == 9) return xtrans[(row + 600) % 6][(col + 600) % 6];
+  return filters >> ((((row << 1) & 14) + (col & 1)) << 1) & 3;
+}
+
+#define VNG_IPS_SIZE (6 * 6 * 352 * sizeof(int))
+typedef struct vng_tables_t
+{
+  int32_t lookup[16][16][32];
+  int ips[6 * 6 * 352];
+  int code[16][16];
+} vng_tables_t;
+
+static void vng_tables(vng_tables_t *tb, const uint32_t filters4, const uint8_t (*const xtrans)[6])
+{
+  const int is_xtrans = filters4 == 9;
+  const int lsize = is_xtrans ? 6 : 16;
+  const int colors = is_xtrans ? 3 : 4;
+  const int prow = is_xtrans ? 6 : 8;
+  const int pcol = is_xtrans ? 6 : 2;
+  memset(tb, 0, sizeof(*tb));
+  for(int row = 0; row < lsize; row++)
+    for(int col = 0; col < lsize; col++)
+    {
+      int32_t *ip = &tb->lookup[row][col][1];
+      int sum[4] = { 0 };
+      const int f = fcol(row, col, filters4, xtrans);
+      for(int y = -1; y <= 1; y++)
+        for(int x = -1; x <= 1; x++)
+        {
+          const int weight = 1 << ((y == 0) + (x == 0));
+          const int color = fcol(row + y, col + x, filters4, xtrans);
+          if(color == f) continue;
+          *ip++ = (y << 16) | (x & 0xffffu);
+          *ip++ = weight;
+          *ip++ = color;
+          sum[color] += weight;
+        }
+      tb->lookup[row][col][0] = (ip - &tb->lookup[row][col][0]) / 3;
+      for(int c = 0; c < colors; c++)
+        if(c != f)
+        {
+          *ip++ = c;
+          *ip++ = sum[c];
+        }
+      *ip = f;
+    }
+
+  int *ip = tb->ips;
+  for(int row = 0; row < prow; row++)
+    for(int col = 0; col < pcol; col++)
+    {
+      tb->code[row][col] = ip - tb->ips;
+      const signed char *cp = vng_terms;
+      for(int t = 0; t < 64; t++)
+      {
+        const int y1 = *cp++, x1 = *cp++;
+        const int y2 = *cp++, x2 = *cp++;
+        const int weight = *cp++;
+        const int grads = *cp++;
+        const int color = fcol(row + y1, col + x1, filters4, xtrans);
+        if(fcol(row + y2, col + x2, filters4, xtrans) != color) continue;
+        const int diag = (fcol(row, col + 1, filters4, xtrans) == color
+                          && fcol(row + 1, col, filters4, xtrans) == color) ? 2 : 1;
+        if(abs(y1 - y2) == diag && abs(x1 - x2) == diag) continue;
+        *ip++ = (y1 << 16) | (x1 & 0xffffu);
+        *ip++ = (y2 << 16) | (x2 & 0xffffu);
+        *ip++ = (color << 16) | (weight & 0xffffu);
+        for(int g = 0; g < 8; g++)
+          if(grads & 1 << g) *ip++ = g;
+        *ip++ = -1;
+      }
+      *ip++ = 0x7fffffff;
+      cp = vng_chood;
+      for(int g = 0; g < 8; g++)
+      {
+        const int y = *cp++, x = *cp++;
+        *ip++ = (y << 16) | (x & 0xffffu);
+        const int color = fcol(row, col, filters4, xtrans);
+        if(fcol(row + y, col + x, filters4, xtrans) != color
+           && fcol(row + y * 2, col + x * 2, filters4, xtrans) == color)
+        {
+          *ip++ = (2 * y << 16) | (2 * x & 0xffffu);
+          *ip++ = color;
+        }
+        else
+        {
+          *ip++ = 0;
+          *ip++ = 0;
+        }
+      }
+    }
+}
+
+// allhex and sgreen as process_markesteijn_cl() builds them
+static void markesteijn_hex(const uint8_t (*const xtrans)[6], signed char allhex[3][3][8][2], int sgreen[2])
+{
+  static const short orth[12] = { 1, 0, 0, 1, -1, 0, 0, -1, 1, 0, 0, 1 },
+                     patt[2][16] = { { 0, 1, 0, -1, 2, 0, -1, 0, 1, 1, 1, -1, 0, 0, 0, 0 },
+                                     { 0, 1, 0, -2, 1, 0, -2, 0, 1, 1, -2, -2, 1, -1, -1, 1 } };
+  memset(allhex, 0, sizeof(signed char) * 3 * 3 * 8 * 2);
+  sgreen[0] = sgreen[1] = 0;
+  for(int row = 0; row < 3; row++)
+    for(int col = 0; col < 3; col++)
+      for(int ng = 0, d = 0; d < 10; d += 2)
+      {
+        const int g = fcol(row, col, 9, xtrans) == 1;
+        if(fcol(row + orth[d] + 6, col + orth[d + 2] + 6, 9, xtrans) == 1)
+          ng = 0;
+        else
+          ng++;
+        if(ng == 4)
+        {
+          sgreen[0] = col;
+          sgreen[1] = row;
+        }
+        if(ng == g + 1)
+          for(int c = 0; c < 8; c++)
+          {
+            const int v = orth[d] * patt[g][c * 2] + orth[d + 1] * patt[g][c * 2 + 1];
+            const int h = orth[d + 2] * patt[g][c * 2] + orth[d + 3] * patt[g][c * 2 + 1];
+            allhex[row][col][c ^ (g * 2 & d)][0] = h;
+            allhex[row][col][c ^ (g * 2 & d)][1] = v;
+          }
+      }
+}
+
 #define IMG_IN(n, px) { .kind = ARG_IMAGE_IN, .name = n, .w = W, .h = H, .channels = 4, .pixels = px }
 #define LUT(n, px, lw, lh) { .kind = ARG_IMAGE_IN, .name = n, .w = lw, .h = lh, .channels = 1, .pixels = px }
 #define IMG_OUT(n) { .kind = ARG_IMAGE_OUT, .name = n, .w = W, .h = H, .channels = 4 }
@@ -212,6 +362,8 @@ static void make_inputs(void)
 #define BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz }
 #define FLOAT4_BUF(n, a, b, c, d) { .kind = ARG_FLOAT4_BUF, .name = n, .v = { a, b, c, d } }
 #define SLANG_INT(n, val) { .kind = ARG_INT, .name = n, .i = val, .slang_only = 1 }
+#define SLANG_BUFFER(n, ptr, sz) { .kind = ARG_BUFFER, .name = n, .data = ptr, .size = sz, .slang_only = 1 }
+#define CHAR2(n, a, b) { .kind = ARG_CHAR2, .name = n, .iv = { a, b } }
 #define RAW_U16(n, ptr, rw, rh) { .kind = ARG_RAW_U16, .name = n, .data = ptr, .w = rw, .h = rh, \
                                   .size = (size_t)(rw) * (rh) * sizeof(uint16_t) }
 
@@ -610,6 +762,251 @@ static int make_tests(test_t *t)
          IMG_OUT("out"), BUFFER("rgb0", rcd_rgb[0], plane), BUFFER("rgb1", rcd_rgb[1], plane),
          BUFFER("rgb2", rcd_rgb[2], plane), INT("w", W), INT("height", H), FLOAT("scale", 1.05f),
          INT("border", 9));
+  }
+
+  // VNG for one Bayer pattern and X-Trans: the linear interpolation over the
+  // whole image and only on a border, and the gradients on its output
+  {
+    static vng_tables_t vng_tb[2];
+    static const char *vng_labels[2][4] = {
+      { "vng_lin_interpolate rggb", "vng_lin_interpolate border rggb", "vng_lin_interpolate linear rggb",
+        "vng_interpolate rggb" },
+      { "vng_lin_interpolate xtrans", "vng_lin_interpolate border xtrans", "vng_lin_interpolate linear xtrans",
+        "vng_interpolate xtrans" } };
+    for(int k = 0; k < 2; k++)
+    {
+      const uint32_t f4 = k ? 9u : bayer[0] | 0x0c0c0c0cu;
+      vng_tables(&vng_tb[k], f4, xtrans);
+      TEST(vng_labels[k][0], "demosaic_vng", "vng_lin_interpolate",
+           RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("border", 0),
+           INT("filters", f4), BUFFER("xtrans", xtrans, sizeof(xtrans)),
+           BUFFER("lookup", vng_tb[k].lookup, sizeof(vng_tb[k].lookup)),
+           LOCAL("buffer", sizeof(float) * 18 * 18), INT("only_linear", 0));
+      TEST(vng_labels[k][1], "demosaic_vng", "vng_lin_interpolate",
+           RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("border", 19),
+           INT("filters", f4), BUFFER("xtrans", xtrans, sizeof(xtrans)),
+           BUFFER("lookup", vng_tb[k].lookup, sizeof(vng_tb[k].lookup)),
+           LOCAL("buffer", sizeof(float) * 18 * 18), INT("only_linear", 1));
+      TEST(vng_labels[k][2], "demosaic_vng", "vng_lin_interpolate",
+           RAW_IN("in", image_raw), IMG_OUT("out"), INT("width", W), INT("height", H), INT("border", 0),
+           INT("filters", f4), BUFFER("xtrans", xtrans, sizeof(xtrans)),
+           BUFFER("lookup", vng_tb[k].lookup, sizeof(vng_tb[k].lookup)),
+           LOCAL("buffer", sizeof(float) * 18 * 18), INT("only_linear", 1));
+      TEST(vng_labels[k][3], "demosaic_vng", "vng_interpolate",
+           IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("filters", f4),
+           BUFFER("xtrans", xtrans, sizeof(xtrans)), BUFFER("ips", vng_tb[k].ips, VNG_IPS_SIZE),
+           BUFFER("code", vng_tb[k].code, sizeof(vng_tb[k].code)), LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
+    }
+  }
+
+  // the Markesteijn steps, each on plausible data of its own: color planes
+  // with all channels set, green limits around them, derivatives and
+  // homogeneity bytes in their ranges. The byte maps are padded to words
+  {
+    static signed char allhex[3][3][8][2];
+    static int sg[2];
+    markesteijn_hex(xtrans, allhex, sg);
+    const size_t npix = (size_t)W * H;
+    const size_t p4 = sizeof(float) * 4 * npix;
+    const size_t bsize = (npix + 3) / 4 * 4;
+    static float *mk_rgb[4], *mk_minmax, *mk_drv, *mk_thresh;
+    static uint8_t *mk_homo, *mk_homosum, *mk_homosum2, *mk_maxval;
+    for(int c = 0; c < 4; c++)
+    {
+      mk_rgb[c] = malloc(p4);
+      for(size_t k = 0; k < 4 * npix; k++) mk_rgb[c][k] = fmaxf(0.0f, image_in[k] * (0.9f + 0.2f * frand()));
+    }
+    mk_minmax = malloc(sizeof(float) * 2 * npix);
+    mk_drv = malloc(sizeof(float) * npix);
+    mk_thresh = malloc(sizeof(float) * npix);
+    mk_homo = calloc(1, bsize);
+    mk_homosum = calloc(1, bsize);
+    mk_homosum2 = calloc(1, bsize);
+    mk_maxval = calloc(1, bsize);
+    for(size_t k = 0; k < npix; k++)
+    {
+      const float g = mk_rgb[0][4 * k + 1];
+      mk_minmax[2 * k] = g - 0.1f * frand();
+      mk_minmax[2 * k + 1] = g + 0.1f * frand();
+      mk_drv[k] = frand() * frand();
+      mk_thresh[k] = 0.1f * frand();
+      mk_homo[k] = rand() % 10;
+      mk_homosum[k] = rand() % 226;
+      mk_homosum2[k] = rand() % 226;
+      mk_maxval[k] = rand() % 226;
+    }
+#define BYTES_INOUT(n, ptr) { .kind = ARG_BUFFER_OUT, .name = n, .data = ptr, .size = bsize, .bytes = 1 }
+#define MK_HEX BUFFER("allhex", allhex, sizeof(allhex))
+#define MK_XT BUFFER("xtrans", xtrans, sizeof(xtrans))
+    TEST("markesteijn_initial_copy", "demosaic_markesteijn", "markesteijn_initial_copy",
+         RAW_IN("in", image_raw), BUFFER_OUT("rgb", mk_rgb[0], p4), INT("width", W), INT("height", H), MK_XT);
+    TEST("markesteijn_green_minmax", "demosaic_markesteijn", "markesteijn_green_minmax",
+         BUFFER("rgb", mk_rgb[0], p4), BUFFER_OUT("gminmax", NULL, sizeof(float) * 2 * npix), INT("width", W),
+         INT("height", H), INT("border", 3), CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX,
+         LOCAL("buffer", sizeof(float) * 22 * 22));
+    TEST("markesteijn_interpolate_green", "demosaic_markesteijn", "markesteijn_interpolate_green",
+         SLANG_BUFFER("rgb_in", mk_rgb[0], p4),
+         BUFFER_OUT("rgb_0", mk_rgb[0], p4), BUFFER_OUT("rgb_1", mk_rgb[1], p4), BUFFER_OUT("rgb_2", mk_rgb[2], p4),
+         BUFFER_OUT("rgb_3", mk_rgb[3], p4), BUFFER("gminmax", mk_minmax, sizeof(float) * 2 * npix),
+         INT("width", W), INT("height", H), INT("border", 3), CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX,
+         LOCAL("buffer", 4 * sizeof(float) * 28 * 28));
+    for(int d = 0; d < 6; d += 3)
+    {
+      static const char *mk_labels[6] = { "markesteijn_solitary_green d0", 0, 0, "markesteijn_solitary_green d3" };
+      const int i = d & 1 ? 0 : 1;
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_solitary_green",
+           BUFFER_OUT("rgb", mk_rgb[0], p4), BUFFER_OUT("aux", mk_rgb[1], p4), INT("width", W), INT("height", H),
+           INT("border", 5), INT("d", d), CHAR2("dir", i, i ^ 1), INT("hcomp", d & 1 ? 2 : 0),
+           CHAR2("sgreen", sg[0], sg[1]), MK_XT, LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
+    }
+    TEST("markesteijn_recalculate_green", "demosaic_markesteijn", "markesteijn_recalculate_green",
+         BUFFER_OUT("rgb_0", mk_rgb[0], p4), BUFFER_OUT("rgb_1", mk_rgb[1], p4), BUFFER_OUT("rgb_2", mk_rgb[2], p4),
+         BUFFER_OUT("rgb_3", mk_rgb[3], p4), BUFFER("gminmax", mk_minmax, sizeof(float) * 2 * npix),
+         INT("width", W), INT("height", H), INT("border", 6), CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX);
+    for(int d = 0; d < 4; d += 3)
+    {
+      static const char *mk_labels[4] = { "markesteijn_red_and_blue d0", 0, 0, "markesteijn_red_and_blue d3" };
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_red_and_blue",
+           BUFFER_OUT("rgb", mk_rgb[d], p4), INT("width", W), INT("height", H), INT("border", 6), INT("d", d),
+           CHAR2("sgreen", sg[0], sg[1]), MK_XT, LOCAL("buffer", 4 * sizeof(float) * 22 * 22));
+    }
+    for(int d = 0; d < 8; d += 6)
+    {
+      static const char *mk_labels[8] = { "markesteijn_interpolate_twoxtwo d0", 0, 0, 0, 0, 0,
+                                       "markesteijn_interpolate_twoxtwo d6" };
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_interpolate_twoxtwo",
+           BUFFER_OUT("rgb", mk_rgb[d / 2], p4), INT("width", W), INT("height", H), INT("border", 8), INT("d", d),
+           CHAR2("sgreen", sg[0], sg[1]), MK_XT, MK_HEX, LOCAL("buffer", 4 * sizeof(float) * 20 * 20));
+    }
+    TEST("markesteijn_convert_yuv", "demosaic_markesteijn", "markesteijn_convert_yuv",
+         BUFFER("rgb", mk_rgb[0], p4), BUFFER_OUT("yuv", mk_rgb[1], p4), INT("width", W), INT("height", H),
+         INT("border", 8));
+    for(int d = 0; d < 8; d += 5)
+    {
+      static const char *mk_labels[8] = { "markesteijn_differentiate d0", 0, 0, 0, 0, "markesteijn_differentiate d5" };
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_differentiate",
+           BUFFER("yuv", mk_rgb[1], p4), BUFFER_OUT("drv", mk_drv, sizeof(float) * npix), INT("width", W),
+           INT("height", H), INT("border", 8), INT("d", d), LOCAL("buffer", 4 * sizeof(float) * 18 * 18));
+    }
+    for(int d = 0; d < 2; d++)
+    {
+      static const char *mk_labels[2] = { "markesteijn_homo_threshold d0", "markesteijn_homo_threshold d1" };
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_homo_threshold",
+           BUFFER("drv", mk_drv, sizeof(float) * npix), BUFFER_OUT("thresh", mk_thresh, sizeof(float) * npix),
+           INT("width", W), INT("height", H), INT("border", 10), INT("d", d));
+    }
+    TEST("markesteijn_homo_set", "demosaic_markesteijn", "markesteijn_homo_set",
+         BUFFER("drv", mk_drv, sizeof(float) * npix), BUFFER("thresh", mk_thresh, sizeof(float) * npix),
+         BYTES_INOUT("homo", mk_homo), INT("width", W), INT("height", H), INT("border", 10),
+         LOCAL("buffer", sizeof(float) * 18 * 18));
+    TEST("markesteijn_homo_sum", "demosaic_markesteijn", "markesteijn_homo_sum",
+         BUFFER("homo", mk_homo, bsize), BYTES_INOUT("homosum", mk_homosum), INT("width", W), INT("height", H),
+         INT("border", 12), LOCAL("buffer", 20 * 20));
+    for(int d = 0; d < 2; d++)
+    {
+      static const char *mk_labels[2] = { "markesteijn_homo_max d0", "markesteijn_homo_max d1" };
+      TEST(mk_labels[d], "demosaic_markesteijn", "markesteijn_homo_max",
+           BUFFER("homosum", mk_homosum, bsize), BYTES_INOUT("maxval", mk_maxval), INT("width", W),
+           INT("height", H), INT("border", 12), INT("d", d));
+    }
+    TEST("markesteijn_homo_max_corr", "demosaic_markesteijn", "markesteijn_homo_max_corr",
+         BYTES_INOUT("maxval", mk_maxval), INT("width", W), INT("height", H), INT("border", 12));
+    TEST("markesteijn_homo_quench", "demosaic_markesteijn", "markesteijn_homo_quench",
+         BYTES_INOUT("homosum1", mk_homosum), BYTES_INOUT("homosum2", mk_homosum2), INT("width", W),
+         INT("height", H), INT("border", 12));
+    TEST("markesteijn_accu", "demosaic_markesteijn", "markesteijn_accu",
+         IMG_IN("in", image_in), IMG_OUT("out"), BUFFER("rgb", mk_rgb[2], p4), BUFFER("homosum", mk_homosum, bsize),
+         BUFFER("maxval", mk_maxval, bsize), INT("width", W), INT("height", H), INT("border", 12));
+    TEST("markesteijn_final", "demosaic_markesteijn", "markesteijn_final",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H), INT("border", 12));
+#undef BYTES_INOUT
+#undef MK_HEX
+#undef MK_XT
+  }
+
+  // tone curve on Lab: the a and b curves bounded and unbounded, a and b
+  // scaled with L, the curve on XYZ, and on ProPhoto RGB with and without a norm
+  {
+    static const float tc_coeffs_ab[12] = { 1.25f, 1.0f, 1.4f, 1.3f, 1.0f, 1.2f,
+                                            1.2f, 1.0f, 1.3f, 1.35f, 1.0f, 1.5f };
+    static const char *tc_labels[6] = { "tonecurve ab", "tonecurve ab unbounded", "tonecurve scaled ab",
+                                        "tonecurve xyz", "tonecurve rgb", "tonecurve rgb luminance" };
+    static const int tc_autoscale[6] = { 0, 0, 1, 2, 3, 3 };
+    // past the a and b curves the L curve is looked up, without
+    // interpolation, at a value converted from Lab: float noise can move that
+    // to the next LUT entry, and the conversion back from far out of gamut
+    // pixels of the noise image amplifies it, up to about 5e-3
+    for(int k = 0; k < 6; k++)
+      TEST_TOL(tc_labels[k], "basic", "tonecurve", k >= 3 ? 1e-2 : 0.0,
+               IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+               LUT("table_L", lut_curve, 256, 256), LUT("table_a", lut_curve, 256, 256),
+               LUT("table_b", lut_curve, 256, 256), INT("autoscale_ab", tc_autoscale[k]),
+               INT("unbound_ab", k == 1), BUFFER("coeffs_L", coeffs_linear, sizeof(coeffs_linear)),
+               BUFFER("coeffs_ab", tc_coeffs_ab, sizeof(tc_coeffs_ab)), FLOAT("low_approximation", 0.7f),
+               INT("preserve_colors", k == 5 ? 1 : 0),
+               BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
+               LUT("lut", lut_profile, 256, 256 * 6));
+  }
+
+  // vignette: darkening and brightening, clipped and unbounded
+  for(int k = 0; k < 2; k++)
+  {
+    static const char *vg_labels[2] = { "vignette darken", "vignette brighten unbounded" };
+    TEST(vg_labels[k], "extended", "vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT2("scale", 2.0f / W, 2.4f / H), FLOAT2("roi_center_scaled", 1.1f, 0.9f),
+         FLOAT2("expt", 2.0f / 1.3f, 1.3f / 2.0f), FLOAT("dscale", 0.3f), FLOAT("fscale", 0.5f),
+         FLOAT("brightness", k ? 0.4f : -0.6f), FLOAT("saturation", k ? -0.3f : 0.5f),
+         FLOAT("dither", 1.0f / 256), INT("unbound", k));
+  }
+
+  // rotate and perspective: a slight rotation with a keystone, partly
+  // outside the input
+  {
+    static const float as_homo[9] = { 0.995f, -0.06f, 9.0f, 0.07f, 1.01f, -6.0f, 1.2e-5f, -2e-5f, 1.0f };
+    static const char *as_kernels[4] = { "ashift_bilinear", "ashift_bicubic", "ashift_lanczos2", "ashift_lanczos3" };
+    // the homography lands a few ulp apart on the two devices, which on a
+    // noise image moves the interpolated values by up to about 1.6e-4
+    for(int k = 0; k < 4; k++)
+      TEST_TOL(as_kernels[k], "basic", as_kernels[k], 5e-4,
+               IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+               INT("iwidth", W), INT("iheight", H), INT2("roi_in", 3, 2), INT2("roi_out", 1, 4),
+               FLOAT("in_scale", 1.0f), FLOAT("out_scale", 1.0f), FLOAT2("clip", 2.5f, 1.5f),
+               BUFFER("homograph", as_homo, sizeof(as_homo)));
+  }
+
+  // contrast equalizer: the edge-aware wavelet steps at a fine and a coarse scale
+  {
+    static float eaw_filter[25];
+    static const float m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    for(int j = 0; j < 5; j++)
+      for(int i = 0; i < 5; i++) eaw_filter[j * 5 + i] = m[i] * m[j];
+    for(int s = 0; s < 4; s += 3)
+    {
+      static const char *eaw_labels[4] = { "eaw_decompose scale 0", 0, 0, "eaw_decompose scale 3" };
+      TEST_TOL(eaw_labels[s], "atrous", "eaw_decompose", 1e-5,
+               IMG_IN("in", image_in), IMG_OUT("coarse"), IMG_OUT("detail"), INT("width", W), INT("height", H),
+               INT("scale", s), FLOAT("sharpen", 2.5f), BUFFER("filter", eaw_filter, sizeof(eaw_filter)));
+    }
+    TEST("eaw_synthesize", "atrous", "eaw_synthesize",
+         IMG_OUT("out"), IMG_IN("coarse", image_in), IMG_IN("detail", image_lab), INT("width", W),
+         INT("height", H), FLOAT4("threshold", 10.0f, 5.0f, 6.0f, 0.0f), FLOAT4("boost", 1.2f, 0.8f, 1.5f, 1.0f));
+  }
+
+  // haze removal: the box filters along rows and columns, the transition map
+  // and the dehazing
+  {
+    static const char *hz_kernels[4] = { "hazeremoval_box_min_x", "hazeremoval_box_min_y",
+                                         "hazeremoval_box_max_x", "hazeremoval_box_max_y" };
+    for(int k = 0; k < 4; k++)
+      TEST_LINE(hz_kernels[k], "hazeremoval", hz_kernels[k], 0.0, (k & 1) ? W : H,
+                INT("width", W), INT("height", H), RAW_IN("in", image_raw), RAW_OUT("out"), INT("w", 6));
+    TEST("hazeremoval_transision_map", "hazeremoval", "hazeremoval_transision_map",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_OUT("out"), FLOAT("strength", 0.6f),
+         FLOAT("A0_r", 0.9f), FLOAT("A0_g", 0.95f), FLOAT("A0_b", 1.05f));
+    TEST("hazeremoval_dehaze", "hazeremoval", "hazeremoval_dehaze",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_IN("trans_map", rcd_dir),
+         IMG_OUT("out"), FLOAT("t_min", 0.1f), FLOAT4("A0", 0.9f, 0.95f, 1.05f, 0.0f));
   }
 
   // resampling, with plans like _prepare_resampling_plan() makes them: per
@@ -1846,6 +2243,12 @@ static void cl_run(cl_env_t *e, const char *cl_dir, const test_t *t, void **outs
       case ARG_FLOAT2:
         CK(clSetKernelArg(k, a_cl, 2 * sizeof(float), arg->v));
         break;
+      case ARG_CHAR2:
+      {
+        const cl_char2 c2 = { { (cl_char)arg->iv[0], (cl_char)arg->iv[1] } };
+        CK(clSetKernelArg(k, a_cl, sizeof(c2), &c2));
+        break;
+      }
     }
   }
 
@@ -2236,14 +2639,16 @@ static void vk_run(vk_env_t *e, const char *spv_dir, const test_t *t, void **out
       case ARG_INT4:
       case ARG_STRUCT:
       case ARG_FLOAT2:
+      case ARG_CHAR2:
       {
         const size_t sz = arg->kind == ARG_STRUCT ? arg->size
                         : arg->kind == ARG_FLOAT4 || arg->kind == ARG_INT4 ? 16
-                        : arg->kind == ARG_INT2 || arg->kind == ARG_FLOAT2 ? 8 : 4;
+                        : arg->kind == ARG_INT2 || arg->kind == ARG_FLOAT2 || arg->kind == ARG_CHAR2 ? 8 : 4;
         const void *src = arg->kind == ARG_STRUCT ? arg->data
                         : arg->kind == ARG_INT ? (const void *)&arg->i
                         : arg->kind == ARG_FLOAT ? (const void *)&arg->f
-                        : arg->kind == ARG_INT2 || arg->kind == ARG_INT4 ? (const void *)arg->iv
+                        : arg->kind == ARG_INT2 || arg->kind == ARG_INT4 || arg->kind == ARG_CHAR2
+                          ? (const void *)arg->iv
                         : (const void *)arg->v;
         if(p->offset < 0 || p->offset + sz > sizeof(push)) die("%s: bad offset for %s", t->kernel, arg->name);
         memcpy(push + p->offset, src, sz);
