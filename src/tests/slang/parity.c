@@ -924,6 +924,91 @@ static int make_tests(test_t *t)
 #undef MK_XT
   }
 
+  // tone curve on Lab: the a and b curves bounded and unbounded, a and b
+  // scaled with L, the curve on XYZ, and on ProPhoto RGB with and without a norm
+  {
+    static const float tc_coeffs_ab[12] = { 1.25f, 1.0f, 1.4f, 1.3f, 1.0f, 1.2f,
+                                            1.2f, 1.0f, 1.3f, 1.35f, 1.0f, 1.5f };
+    static const char *tc_labels[6] = { "tonecurve ab", "tonecurve ab unbounded", "tonecurve scaled ab",
+                                        "tonecurve xyz", "tonecurve rgb", "tonecurve rgb luminance" };
+    static const int tc_autoscale[6] = { 0, 0, 1, 2, 3, 3 };
+    // past the a and b curves the L curve is looked up, without
+    // interpolation, at a value converted from Lab: float noise can move that
+    // to the next LUT entry, and the conversion back from far out of gamut
+    // pixels of the noise image amplifies it, up to about 5e-3
+    for(int k = 0; k < 6; k++)
+      TEST_TOL(tc_labels[k], "basic", "tonecurve", k >= 3 ? 1e-2 : 0.0,
+               IMG_IN("in", image_lab), IMG_OUT("out"), INT("width", W), INT("height", H),
+               LUT("table_L", lut_curve, 256, 256), LUT("table_a", lut_curve, 256, 256),
+               LUT("table_b", lut_curve, 256, 256), INT("autoscale_ab", tc_autoscale[k]),
+               INT("unbound_ab", k == 1), BUFFER("coeffs_L", coeffs_linear, sizeof(coeffs_linear)),
+               BUFFER("coeffs_ab", tc_coeffs_ab, sizeof(tc_coeffs_ab)), FLOAT("low_approximation", 0.7f),
+               INT("preserve_colors", k == 5 ? 1 : 0),
+               BUFFER("profile_info", &profile_linear, sizeof(profile_info_t)),
+               LUT("lut", lut_profile, 256, 256 * 6));
+  }
+
+  // vignette: darkening and brightening, clipped and unbounded
+  for(int k = 0; k < 2; k++)
+  {
+    static const char *vg_labels[2] = { "vignette darken", "vignette brighten unbounded" };
+    TEST(vg_labels[k], "extended", "vignette",
+         IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+         FLOAT2("scale", 2.0f / W, 2.4f / H), FLOAT2("roi_center_scaled", 1.1f, 0.9f),
+         FLOAT2("expt", 2.0f / 1.3f, 1.3f / 2.0f), FLOAT("dscale", 0.3f), FLOAT("fscale", 0.5f),
+         FLOAT("brightness", k ? 0.4f : -0.6f), FLOAT("saturation", k ? -0.3f : 0.5f),
+         FLOAT("dither", 1.0f / 256), INT("unbound", k));
+  }
+
+  // rotate and perspective: a slight rotation with a keystone, partly
+  // outside the input
+  {
+    static const float as_homo[9] = { 0.995f, -0.06f, 9.0f, 0.07f, 1.01f, -6.0f, 1.2e-5f, -2e-5f, 1.0f };
+    static const char *as_kernels[4] = { "ashift_bilinear", "ashift_bicubic", "ashift_lanczos2", "ashift_lanczos3" };
+    // the homography lands a few ulp apart on the two devices, which on a
+    // noise image moves the interpolated values by up to about 1.6e-4
+    for(int k = 0; k < 4; k++)
+      TEST_TOL(as_kernels[k], "basic", as_kernels[k], 5e-4,
+               IMG_IN("in", image_in), IMG_OUT("out"), INT("width", W), INT("height", H),
+               INT("iwidth", W), INT("iheight", H), INT2("roi_in", 3, 2), INT2("roi_out", 1, 4),
+               FLOAT("in_scale", 1.0f), FLOAT("out_scale", 1.0f), FLOAT2("clip", 2.5f, 1.5f),
+               BUFFER("homograph", as_homo, sizeof(as_homo)));
+  }
+
+  // contrast equalizer: the edge-aware wavelet steps at a fine and a coarse scale
+  {
+    static float eaw_filter[25];
+    static const float m[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    for(int j = 0; j < 5; j++)
+      for(int i = 0; i < 5; i++) eaw_filter[j * 5 + i] = m[i] * m[j];
+    for(int s = 0; s < 4; s += 3)
+    {
+      static const char *eaw_labels[4] = { "eaw_decompose scale 0", 0, 0, "eaw_decompose scale 3" };
+      TEST_TOL(eaw_labels[s], "atrous", "eaw_decompose", 1e-5,
+               IMG_IN("in", image_in), IMG_OUT("coarse"), IMG_OUT("detail"), INT("width", W), INT("height", H),
+               INT("scale", s), FLOAT("sharpen", 2.5f), BUFFER("filter", eaw_filter, sizeof(eaw_filter)));
+    }
+    TEST("eaw_synthesize", "atrous", "eaw_synthesize",
+         IMG_OUT("out"), IMG_IN("coarse", image_in), IMG_IN("detail", image_lab), INT("width", W),
+         INT("height", H), FLOAT4("threshold", 10.0f, 5.0f, 6.0f, 0.0f), FLOAT4("boost", 1.2f, 0.8f, 1.5f, 1.0f));
+  }
+
+  // haze removal: the box filters along rows and columns, the transition map
+  // and the dehazing
+  {
+    static const char *hz_kernels[4] = { "hazeremoval_box_min_x", "hazeremoval_box_min_y",
+                                         "hazeremoval_box_max_x", "hazeremoval_box_max_y" };
+    for(int k = 0; k < 4; k++)
+      TEST_LINE(hz_kernels[k], "hazeremoval", hz_kernels[k], 0.0, (k & 1) ? W : H,
+                INT("width", W), INT("height", H), RAW_IN("in", image_raw), RAW_OUT("out"), INT("w", 6));
+    TEST("hazeremoval_transision_map", "hazeremoval", "hazeremoval_transision_map",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_OUT("out"), FLOAT("strength", 0.6f),
+         FLOAT("A0_r", 0.9f), FLOAT("A0_g", 0.95f), FLOAT("A0_b", 1.05f));
+    TEST("hazeremoval_dehaze", "hazeremoval", "hazeremoval_dehaze",
+         INT("width", W), INT("height", H), IMG_IN("in", image_in), RAW_IN("trans_map", rcd_dir),
+         IMG_OUT("out"), FLOAT("t_min", 0.1f), FLOAT4("A0", 0.9f, 0.95f, 1.05f, 0.0f));
+  }
+
   // resampling, with plans like _prepare_resampling_plan() makes them: per
   // output pixel a length index, a kernel offset and an index offset, here
   // with 2 to 6 taps

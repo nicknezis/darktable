@@ -20,6 +20,7 @@
 // pipe runs. The others follow with their modules.
 
 import color_conversion;
+import rgb_norms;
 
 // Metal drops buffers and images a kernel does not read, which would shift
 // every later binding (see src/common/slang_gpu_metal.m). A kernel that ignores
@@ -1339,4 +1340,259 @@ void rawoverexposed_falsecolor(uint3 gid : SV_DispatchThreadID,
   else if(c == 1) pixel.y = 0.0f;
   else if(c == 0) pixel.x = 0.0f;
   out.write(int2(x, y), pixel);
+}
+
+float _lookup_unbounded_buf(ImageIn lut, float x, StructuredBuffer<float> coeffs)
+{
+  const float a[3] = { coeffs[0], coeffs[1], coeffs[2] };
+  return lookup_unbounded(lut, x, a);
+}
+
+// the curve of an a or b channel with extrapolation on both sides: a[0..2]
+// for the right one, a[3..5] for the left one with an inverted x axis
+float _lookup_unbounded_twosided(ImageIn lut, float x, StructuredBuffer<float> coeffs, int o)
+{
+  // in case the tone curve is marked as linear, return the fast
+  // path to linear unbounded (does not clip x at 1)
+  if(coeffs[o] >= 0.0f)
+  {
+    const float ar = 1.0f / coeffs[o];
+    const float al = 1.0f - 1.0f / coeffs[o + 3];
+    if(x < ar && x >= al)
+    {
+      const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
+      return lut.read(int2(xi & 0xff, xi >> 8)).x;
+    }
+    else
+    {
+      const float xx = (x >= ar) ? x : 1.0f - x;
+      const int s = (x >= ar) ? o : o + 3;
+      return coeffs[s + 1] * dtcl_pow(xx * coeffs[s], coeffs[s + 2]);
+    }
+  }
+  else return x;
+}
+
+/* kernel for the tonecurve plugin. */
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void tonecurve(uint3 gid : SV_DispatchThreadID,
+               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+               uniform ImageIn table_L, uniform ImageIn table_a, uniform ImageIn table_b,
+               uniform int autoscale_ab, uniform int unbound_ab, uniform StructuredBuffer<float> coeffs_L,
+               uniform StructuredBuffer<float> coeffs_ab, uniform float low_approximation,
+               uniform int preserve_colors, uniform StructuredBuffer<ProfileInfo> profile_info,
+               uniform ImageIn lut)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.read(int2(x, y));
+  const float L_in = pixel.x / 100.0f;
+  // use lut or extrapolation:
+  const float L = _lookup_unbounded_buf(table_L, L_in, coeffs_L);
+
+  if(autoscale_ab == 0)
+  {
+    const float a_in = (pixel.y + 128.0f) / 256.0f;
+    const float b_in = (pixel.z + 128.0f) / 256.0f;
+
+    if(unbound_ab == 0)
+    {
+      pixel.y = lookup(table_a, a_in);
+      pixel.z = lookup(table_b, b_in);
+    }
+    else
+    {
+      // use lut or two-sided extrapolation
+      pixel.y = _lookup_unbounded_twosided(table_a, a_in, coeffs_ab, 0);
+      pixel.z = _lookup_unbounded_twosided(table_b, b_in, coeffs_ab, 6);
+    }
+    pixel.x = L;
+  }
+  else if(autoscale_ab == 1)
+  {
+    if(L_in > 0.01f)
+    {
+      pixel.y *= L / pixel.x;
+      pixel.z *= L / pixel.x;
+    }
+    else
+    {
+      pixel.y *= low_approximation;
+      pixel.z *= low_approximation;
+    }
+    pixel.x = L;
+  }
+  else if(autoscale_ab == 2)
+  {
+    float4 xyz = Lab_to_XYZ(pixel);
+    xyz.x = _lookup_unbounded_buf(table_L, xyz.x, coeffs_L);
+    xyz.y = _lookup_unbounded_buf(table_L, xyz.y, coeffs_L);
+    xyz.z = _lookup_unbounded_buf(table_L, xyz.z, coeffs_L);
+    pixel.xyz = XYZ_to_Lab(xyz).xyz;
+  }
+  else if(autoscale_ab == 3)
+  {
+    float4 rgb = Lab_to_prophotorgb(pixel);
+
+    if(preserve_colors == DT_RGB_NORM_NONE)
+    {
+      rgb.x = _lookup_unbounded_buf(table_L, rgb.x, coeffs_L);
+      rgb.y = _lookup_unbounded_buf(table_L, rgb.y, coeffs_L);
+      rgb.z = _lookup_unbounded_buf(table_L, rgb.z, coeffs_L);
+    }
+    else
+    {
+      float ratio = 1.f;
+      const float lum = dt_rgb_norm(rgb, preserve_colors, 1, profile_info[0], lut);
+      if(lum > 0.f)
+      {
+        const float curve_lum = _lookup_unbounded_buf(table_L, lum, coeffs_L);
+        ratio = curve_lum / lum;
+      }
+      rgb.xyz *= ratio;
+    }
+    pixel.xyz = prophotorgb_to_Lab(rgb).xyz;
+  }
+
+  out.write(int2(x, y), pixel);
+}
+
+// ---------------------------------------------------------------------------
+// ashift
+
+// ashift_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl: kwidth
+// 0 is bilinear, otherwise lanczos selects the filter, 0 for bicubic
+void _ashift(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
+             const int iwidth, const int iheight, const int2 roi_in, const int2 roi_out,
+             const float in_scale, const float out_scale, const float2 clip,
+             StructuredBuffer<float> homograph, const int kwidth, const int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+
+  if(x >= width || y >= height) return;
+
+  float pin[3], pout[3];
+
+  // convert output pixel coordinates to original image coordinates
+  pout[0] = roi_out.x + x + clip.x;
+  pout[1] = roi_out.y + y + clip.y;
+  pout[0] /= out_scale;
+  pout[1] /= out_scale;
+  pout[2] = 1.0f;
+
+  // apply homograph
+  for(int i = 0; i < 3; i++)
+  {
+    pin[i] = 0.0f;
+    for(int j = 0; j < 3; j++) pin[i] += homograph[3 * i + j] * pout[j];
+  }
+
+  // convert to input pixel coordinates
+  pin[0] /= pin[2];
+  pin[1] /= pin[2];
+  pin[0] *= in_scale;
+  pin[1] *= in_scale;
+  pin[0] -= roi_in.x;
+  pin[1] -= roi_in.y;
+  const float rx = pin[0];
+  const float ry = pin[1];
+
+  float4 pixel = float4(0.0f);
+  if(kwidth == 0)
+  {
+    // done by hand, as hardware bilinear interpolation can't mirror
+    if(rx >= -1.0f && ry >= -1.0f && rx < float(iwidth) && ry < float(iheight))
+    {
+      const float fx = floor(rx);
+      const float fy = floor(ry);
+      const float dx = rx - fx;
+      const float dy = ry - fy;
+
+      const int x0 = clip_mirror(int(fx), iwidth - 1);
+      const int x1 = clip_mirror(int(fx) + 1, iwidth - 1);
+      const int y0 = clip_mirror(int(fy), iheight - 1);
+      const int y1 = clip_mirror(int(fy) + 1, iheight - 1);
+
+      pixel = (1.0f - dy) * ((1.0f - dx) * in.Areadpixel(x0, y0) + dx * in.Areadpixel(x1, y0))
+              + dy * ((1.0f - dx) * in.Areadpixel(x0, y1) + dx * in.Areadpixel(x1, y1));
+    }
+  }
+  else
+  {
+    const int tx = int(floor(rx));
+    const int ty = int(floor(ry));
+
+    float weight = 0.0f;
+    for(int jj = 1 - kwidth; jj <= kwidth; jj++)
+      for(int ii = 1 - kwidth; ii <= kwidth; ii++)
+      {
+        const int i = tx + ii;
+        const int j = ty + jj;
+
+        const float wx = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(i) - rx)
+                                      : interpolation_func_bicubic(float(i) - rx);
+        const float wy = lanczos != 0 ? interpolation_func_lanczos(float(lanczos), float(j) - ry)
+                                      : interpolation_func_bicubic(float(j) - ry);
+        const float w = wx * wy;
+
+        pixel += in.Areadpixel(clip_mirror(i, iwidth - 1), clip_mirror(j, iheight - 1)) * w;
+        weight += w;
+      }
+
+    pixel = (tx >= -1 && ty >= -1 && tx < iwidth && ty < iheight) ? pixel / weight : float4(0.0f);
+  }
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_bilinear(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 0, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_bicubic(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                    uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                    uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                    uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 2, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_lanczos2(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 2, 2);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void ashift_lanczos3(uint3 gid : SV_DispatchThreadID,
+                     uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                     uniform int iwidth, uniform int iheight, uniform int2 roi_in, uniform int2 roi_out,
+                     uniform float in_scale, uniform float out_scale, uniform float2 clip,
+                     uniform StructuredBuffer<float> homograph)
+{
+  _ashift(gid, in, out, width, height, iwidth, iheight, roi_in, roi_out, in_scale, out_scale, clip,
+          homograph, 3, 3);
 }
