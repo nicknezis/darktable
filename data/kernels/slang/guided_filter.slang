@@ -70,6 +70,44 @@ void _box_mean(ImageIn in, ImageOut out, int line, int n, int i0, int i1, int w,
   }
 }
 
+// the horizontal box means for windows up to 2 * 32 + 1 wide, one pixel per
+// work item, from the rows of the work group staged in group shared memory.
+// The work items of a running sum walk a chunk one after the other, which
+// leaves a GPU waiting on memory; this way they all read at once. Along y the
+// line kernel stays faster: its work items already read neighboring pixels
+static const int BOX_TILE_MAX_W = 32;
+groupshared float box_tile[16 * (16 + 2 * BOX_TILE_MAX_W)];
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void guided_filter_box_mean_x_tile(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
+                                   uniform int width, uniform int height,
+                                   uniform ImageIn in, uniform ImageOut out, uniform int w)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  const int x0 = x - int(lid.x);
+  const int y0 = y - int(lid.y);
+  const int len = 16 + 2 * w;
+
+  for(int k = int(lid.y * 16 + lid.x); k < 16 * len; k += 256)
+  {
+    const int xx = x0 - w + k % len;
+    const int yy = y0 + k / len;
+    box_tile[k] = (xx >= 0 && xx < width && yy >= 0 && yy < height) ? in.readA(int2(xx, yy)).x : 0.0f;
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  if(x >= width || y >= height) return;
+
+  const int base = int(lid.y) * len + w - x0;
+  float m = 0.f, c = 0.f;
+  const int j0 = max(x - w, 0);
+  const int j1 = min(x + w + 1, width);
+  for(int j = j0; j < j1; j++) Kahan_sum(m, c, box_tile[base + j]);
+  out.write(int2(x, y), float4(m / float(j1 - j0)));
+}
+
 // work item x, y takes chunk values of row y from x * chunk on
 [shader("compute")]
 [numthreads(16, 16, 1)]
