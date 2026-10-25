@@ -42,32 +42,23 @@ Current status as implemented by Jandren:
 
 #include <math.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "bauhaus/bauhaus.h"
 #include "common/darktable.h"
-#include "common/fast_guided_filter.h"
-#include "common/eigf.h"
-#include "common/luminance_mask.h"
+#include "common/fast_gaussian_guided_filter.h"
 #include "common/opencl.h"
 #include "common/bilinear.h"
 #include "common/gaussian.h"
 #include "develop/tiling.h"
 #include "control/conf.h"
 #include "control/control.h"
-#include "develop/blend.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
-#include "gui/accelerators.h"
-#include "gui/draw.h"
 #include "dtgtk/paint.h"
-#include "dtgtk/togglebutton.h"
-#include "dtgtk/expander.h"
 #include "gui/gtk.h"
-#include "gui/presets.h"
 #include "iop/iop_api.h"
 #include "common/iop_group.h"
 
@@ -219,10 +210,10 @@ int legacy_params(dt_iop_module_t *self,
   return 1;
 }
 
-// Compute smoothed luminance mask using edge-aware filters
+// Compute the greyscale log luminance from linear rgb input
 __DT_CLONE_TARGETS__
-static inline void compute_luminance(const float *const restrict in,
-                                      float *const restrict luminance,
+static inline void compute_luminance(const float *const restrict linear_rgb,
+                                      float *const restrict log_luminance,
                                       const dt_iop_roi_t *const roi_in,
                                       const float noise_bias)
 {
@@ -230,19 +221,24 @@ static inline void compute_luminance(const float *const restrict in,
   const size_t height = (size_t)roi_in->height;
   const size_t npixels = width * height;
 
-  // First compute pixel-wise luminance (no boost) and add noise bias
-  luminance_mask(in, luminance, width, height, DT_TONEEQ_NORM_2, 1.0f, 0.0f, 1.0f);
   const float normalize_luminance = 1.0f / sqrtf(3.0f);
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
-    luminance[k] = normalize_luminance * luminance[k] + noise_bias;
+    float rgb_square_sum = 0.0f;
+    for_three_channels(c)
+    {
+      const float channel_value = linear_rgb[4 * k + c];
+      rgb_square_sum += channel_value * channel_value;
+    }
+    const float rgb_norm = normalize_luminance * sqrtf(rgb_square_sum) + noise_bias;
+    log_luminance[k] = log2f(fmaxf(rgb_norm, NORM_MIN));
   }
 }
 
 // Compute smoothed luminance mask using edge-aware filters
 __DT_CLONE_TARGETS__
-static inline void compute_mask(float *const restrict smoothed_luminance,
+static inline void compute_mask(float *const restrict log_smoothed_luminance,
                                 const dt_iop_roi_t *const roi_in,
                                 const dt_iop_contrastntexture_data_t *const d,
                                 const int level)
@@ -250,30 +246,28 @@ static inline void compute_mask(float *const restrict smoothed_luminance,
   const size_t width = (size_t)roi_in->width;
   const size_t height = (size_t)roi_in->height;
 
-  fast_eigf_surface_blur(smoothed_luminance, width, height,
-                         d->radius_details[level], d->feathering, 1,
-                         DT_GF_BLENDING_LINEAR, 1.0f,
-                         0.0f, NORM_MIN, 4.0f);
+  fast_gaussian_guided_filter(log_smoothed_luminance, width, height,
+                        d->radius_details[level], d->feathering);
 }
 
 // Extract logarithmic high pass detail in log space (EV):
 // How much brighter/darker is this pixel compared to the smooth version
 __DT_CLONE_TARGETS__
-static inline float extract_details(const float luminance_pixel,
-                                   const float luminance_smoothed,
-                                   const float noise_bias)
+static inline float extract_details(const float log_luminance_pixel,
+                                    const float log_luminance_smoothed,
+                                    const float noise_bias)
 {
-  const float log_pixel = log2f(fmaxf(luminance_pixel, NORM_MIN));
-  const float log_smoothed = log2f(fmaxf(luminance_smoothed, NORM_MIN));
-
   const float noise_power = noise_bias * noise_bias;
-  const float combined_power = luminance_smoothed * luminance_smoothed;
+  const float smoothed_luminance = exp2f(log_luminance_smoothed);
+  const float combined_power = smoothed_luminance * smoothed_luminance;
   const float weiner_gain = fmaxf(combined_power - noise_power, 0.0f) / fmaxf(combined_power, NORM_MIN);
-  return weiner_gain * fmaxf(fminf(log_pixel - log_smoothed, 5.0f), -5.0f);
+  return weiner_gain * fmaxf(fminf(log_luminance_pixel - log_luminance_smoothed, 5.0f), -5.0f);
 }
 
 // Squared cosine/sine crossfade weight of a given band (coarse/medium/fine) at position t
-static inline float band_weight(const dt_iop_contrastntexture_details_display_t band, const int level, const float max_level)
+static inline float band_weight(const dt_iop_contrastntexture_details_display_t band,
+                                const int level,
+                                const float max_level)
 {
   float t = (float)level / max_level - 0.5f;
   t = fmaxf(fminf(t, 0.5f), -0.5f);
@@ -292,7 +286,7 @@ static inline float band_weight(const dt_iop_contrastntexture_details_display_t 
 // Apply shadow and highlight enhancement
 // Different slopes for shadows and highlights, with a smooth transition in the midtones
 __DT_CLONE_TARGETS__
-static inline float apply_shadows_highlights(const float luminance_lowpass,
+static inline float apply_shadows_highlights(const float log_luminance_lowpass,
                                              const dt_iop_contrastntexture_data_t *const d)
 {
   const float slope_shadows = d->slope_shadows;
@@ -306,7 +300,7 @@ static inline float apply_shadows_highlights(const float luminance_lowpass,
 
   float correction_ev = 0.0f;
   // Low pass correction for shadows and highlights
-  const float normalized_ev = log2f(fmaxf(luminance_lowpass, NORM_MIN)) - pivot_offset;
+  const float normalized_ev = log_luminance_lowpass - pivot_offset;
   if(normalized_ev <= -midtones_width)
     correction_ev += slope_shadows * normalized_ev;
   else if(normalized_ev >= midtones_width)
@@ -343,7 +337,7 @@ static inline void display_local_mask(const float *const restrict corrections,
     const float intensity = local_ev / sqrtf(local_ev * local_ev + 1.0f) * 0.5f + 0.5f; // Smooth mapping to [0, 1]
 
     // Set all RGB channels to the same intensity (grayscale)
-    for_each_channel(c)
+    for_three_channels(c)
     {
       out[4 * k + c] = intensity;
     }
@@ -357,7 +351,7 @@ static inline void display_local_mask(const float *const restrict corrections,
  shadows (blue) and highlights (yellow) control, mapped to linear [0, 1].
  */
 __DT_CLONE_TARGETS__
-static inline void display_lowpass_mask(const float *const restrict luminance_lowpass,
+static inline void display_lowpass_mask(const float *const restrict log_luminance_lowpass,
                                         float *const restrict out,
                                         const dt_iop_roi_t *const roi_in,
                                         const dt_iop_contrastntexture_data_t *const d)
@@ -372,16 +366,17 @@ static inline void display_lowpass_mask(const float *const restrict luminance_lo
   for(size_t k = 0; k < npixels; k++)
   {
     // Low contrast sigmoid for the preview.
-    const float intensity = luminance_lowpass[k] / (pivot_offset + luminance_lowpass[k]);
-    float saturation = (intensity - 0.5f) * 2.0f;
-    saturation *= saturation;
+    const float linear_luminance = exp2f(log_luminance_lowpass[k]);
+    const float display_intensity = linear_luminance / (pivot_offset + linear_luminance);
+    float displat_saturation = (display_intensity - 0.5f) * 2.0f;
+    displat_saturation *= displat_saturation;
 
-    for_each_channel(c)
+    for_three_channels(c)
     {
-      if(intensity < 0.5f)
-        out[4 * k + c] = intensity * ((1.0f - saturation) + saturation * blue[c]);
+      if(display_intensity < 0.5f)
+        out[4 * k + c] = display_intensity * ((1.0f - displat_saturation) + displat_saturation * blue[c]);
       else
-        out[4 * k + c] = intensity * ((1.0f - saturation) + saturation * yellow[c]);
+        out[4 * k + c] = display_intensity * ((1.0f - displat_saturation) + displat_saturation * yellow[c]);
     }
     out[4 * k + 3] = 1.0f;
   }
@@ -406,16 +401,16 @@ void process(dt_iop_module_t *self,
   float *const restrict out = (float *const)ovoid;
 
   const size_t npixels = roi_in->width * roi_in->height;
-  float *restrict luminance_highpass = dt_alloc_align_float(npixels);
-  float *restrict luminance_lowpass = dt_alloc_align_float(npixels);
+  float *restrict log_luminance_highpass = dt_alloc_align_float(npixels);
+  float *restrict log_luminance_lowpass = dt_alloc_align_float(npixels);
   float *restrict corrections = dt_alloc_align_float(npixels);
-  if(!luminance_lowpass ||
-     !luminance_highpass ||
+    if(!log_luminance_lowpass ||
+      !log_luminance_highpass ||
      !corrections)
   {
     dt_control_log(_("contrast and texture failed to allocate memory, check your RAM settings"));
-    dt_free_align(luminance_highpass);
-    dt_free_align(luminance_lowpass);
+    dt_free_align(log_luminance_highpass);
+    dt_free_align(log_luminance_lowpass);
     dt_free_align(corrections);
     return;
   }
@@ -441,7 +436,7 @@ void process(dt_iop_module_t *self,
   {
     piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
     // Preview the displayed band alone, at full strength, across all pyramid levels
-    // (the lowpass preview does not use band weights, the final luminance_lowpass suffices)
+    // (the lowpass preview does not use band weights, the final log_luminance_lowpass suffices)
     if(details_display != DT_LC_MASK_LAST)
     {
       for(int level = 0; level <= d->max_used_level; level++)
@@ -458,35 +453,41 @@ void process(dt_iop_module_t *self,
     for(int level = 0; level <= d->max_used_level; level++)
     {
       for(int band = 0; band < DT_LC_MASK_LAST; band++)
-      gain_per_level[level] += d->gain_details[band] * band_weight(band, level, d->max_detail_level);
+      {
+        gain_per_level[level] += d->gain_details[band] * band_weight(band, level, d->max_detail_level);
+      }
     }
   }
 
   const float max_noise_bias = d->noise_bias[d->max_used_level];
-  compute_luminance(in, luminance_lowpass, roi_in, max_noise_bias);
+  compute_luminance(in, log_luminance_lowpass, roi_in, max_noise_bias);
   memset(corrections, 0, npixels * sizeof(float));
 
   for(int level = d->max_used_level; level >= 0; level--)
   {
-    memcpy(luminance_highpass, luminance_lowpass, npixels * sizeof(float));
-    compute_mask(luminance_lowpass, roi_in, d, level);
+    memcpy(log_luminance_highpass, log_luminance_lowpass, npixels * sizeof(float));
+    compute_mask(log_luminance_lowpass, roi_in, d, level);
 
     DT_OMP_FOR()
     for(size_t k = 0; k < npixels; k++)
     {
       // Details as the bandpass difference
-      corrections[k] += gain_per_level[level] * extract_details(luminance_highpass[k], luminance_lowpass[k], d->noise_bias[level]);
+      corrections[k] += gain_per_level[level] * extract_details(log_luminance_highpass[k], log_luminance_lowpass[k], d->noise_bias[level]);
 
       // Reduce the noise bias to the next level
       if(level > 0)
-        luminance_lowpass[k] -= d->noise_bias[level] - d->noise_bias[level - 1];
+      {
+        const float bias_diff = d->noise_bias[level] - d->noise_bias[level - 1];
+        const float linear_luminance = exp2f(log_luminance_lowpass[k]) - bias_diff;
+        log_luminance_lowpass[k] = log2f(fmaxf(linear_luminance, NORM_MIN));
+      }
     }
   }
 
   if(display_mask)
   {
     if(details_display == DT_LC_MASK_LAST)
-      display_lowpass_mask(luminance_lowpass, out, roi_in, d);
+      display_lowpass_mask(log_luminance_lowpass, out, roi_in, d);
     else
       display_local_mask(corrections, out, roi_in);
   }
@@ -496,18 +497,18 @@ void process(dt_iop_module_t *self,
     for(size_t k = 0; k < npixels; k++)
     {
       // Low pass correction for shadows and highlights
-      const float lowpass_correction = apply_shadows_highlights(luminance_lowpass[k], d);
+      const float lowpass_correction = apply_shadows_highlights(log_luminance_lowpass[k], d);
 
       // Apply correction in linear space
       const float multiplier = exp2f(corrections[k] + lowpass_correction);;
-      for_each_channel(c)
+      for_three_channels(c)
         out[4 * k + c] = in[4 * k + c] * multiplier;
       out[4 * k + 3] = in[4 * k + 3];
     }
   }
 
-  dt_free_align(luminance_highpass);
-  dt_free_align(luminance_lowpass);
+  dt_free_align(log_luminance_highpass);
+  dt_free_align(log_luminance_lowpass);
   dt_free_align(corrections);
 }
 
@@ -617,6 +618,7 @@ void tiling_callback(dt_iop_module_t *self,
   tiling->align = 1;
 }
 
+/* Diverging OpenCL implementation
 #ifdef HAVE_OPENCL
 // fast_eigf_surface_blur() of common/eigf.h without quantization, which is how
 // compute_mask() calls it. In place on a grey device buffer.
@@ -769,6 +771,7 @@ error:
   return err;
 }
 #endif
+*/
 
 #ifdef HAVE_SLANG_GPU
 // _fast_eigf_surface_blur_cl() on the Slang kernels of toneequal.slang
