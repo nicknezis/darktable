@@ -246,6 +246,8 @@ typedef struct dt_iop_lens_data_t
   dt_hash_t vighash;
   // dt_iop_lens_slang_cache_t, the lensfun grids of the Slang path
   void *slang_cache;
+  // the committed params, which the grids are valid for
+  dt_hash_t slang_params_hash;
 } dt_iop_lens_data_t;
 
 
@@ -3258,10 +3260,14 @@ typedef struct dt_iop_lens_slang_grid_t
   int gwidth;
 } dt_iop_lens_slang_grid_t;
 
-// the grids of the last run, kept while the pipe area and the lensfun
-// setup stay the same. commit_params() drops them.
+// the grids of the last run, kept while the pipe area and the committed
+// params stay the same. They are not dropped in commit_params(): a history
+// change that adds an item recommits every module (synch_all in
+// pixelpipe_hb.c), first with its defaults, so the params hash is compared
+// at the next run instead.
 typedef struct dt_iop_lens_slang_cache_t
 {
+  dt_hash_t params_hash;
   dt_iop_roi_t roi_in;
   dt_iop_roi_t roi_out;
   float orig_w;
@@ -3424,7 +3430,8 @@ static int _process_slang_lf(dt_iop_module_t *self,
 
   dt_iop_lens_slang_cache_t *c = (dt_iop_lens_slang_cache_t *)d->slang_cache;
   if(c
-     && (memcmp(&c->roi_in, roi_in, sizeof(dt_iop_roi_t))
+     && (c->params_hash != d->slang_params_hash
+         || memcmp(&c->roi_in, roi_in, sizeof(dt_iop_roi_t))
          || memcmp(&c->roi_out, roi_out, sizeof(dt_iop_roi_t))
          || c->orig_w != orig_w || c->orig_h != orig_h || c->lf_mask != used_lf_mask
          || c->pass_mode != pass_mode))
@@ -3438,6 +3445,7 @@ static int _process_slang_lf(dt_iop_module_t *self,
     const double start = dt_get_wtime();
     c = (dt_iop_lens_slang_cache_t *)calloc(1, sizeof(dt_iop_lens_slang_cache_t));
     if(!c) return 1;
+    c->params_hash = d->slang_params_hash;
     c->roi_in = *roi_in;
     c->roi_out = *roi_out;
     c->orig_w = orig_w;
@@ -3797,7 +3805,8 @@ void commit_params(dt_iop_module_t *self,
   d->v_steepness = p->v_steepness;
 
 #ifdef HAVE_SLANG_GPU
-  _slang_cache_free(d);
+  d->slang_params_hash = dt_hash(DT_INITHASH, p, sizeof(dt_iop_lens_params_t));
+  d->slang_params_hash = dt_hash(d->slang_params_hash, &d->modify_flags, sizeof(d->modify_flags));
 #endif
 
   piece->process_cl_ready = TRUE;
