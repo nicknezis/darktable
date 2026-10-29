@@ -3235,6 +3235,193 @@ static int _slang_copy(dt_slang_gpu_image_t *src,
                                   SLARG(iwidth), SLARG(iheight), SLARG(zero), SLARG(zero));
 }
 
+// the Slang path evaluates lensfun's models on the device when it can, instead
+// of asking lensfun on the CPU for the coordinates of every pixel and uploading
+// them (seconds on a slow CPU and 232 MB for 10 MP). This mirrors lfModifier
+// from lensfun 0.3.x: its constructor's normalization and the callbacks that
+// Initialize() would add for correction and for reverse mode. Projection
+// changes, models the kernels don't know and lensfun 0.3.95+, which
+// reorganized lfModifier, return FALSE and keep the per-pixel coordinates.
+// See lens_lf_distort_* and lens_lf_vignette in data/kernels/slang/basic.slang
+// for the layout of lf and vig.
+static gboolean _slang_lf_model(const dt_iop_lens_data_t *d,
+                                const int modflags,
+                                const int w,
+                                const int h,
+                                float lf[17],
+                                float vig[8])
+{
+#ifdef LF_0395
+  return FALSE;
+#else
+  const lfLens *lens = d->lens;
+  if(modflags & LF_MODIFY_GEOMETRY) return FALSE;
+
+  // "- 1" as lensfun measures the size between the outer pixel centers
+  const float width = w >= 2 ? w - 1 : 1;
+  const float height = h >= 2 ? h - 1 : 1;
+  const float size = MIN(width, height);
+  const float aspect = width < height ? height / width : width / height;
+  const float arc = sqrtf(lens->AspectRatio * lens->AspectRatio + 1.0f);
+  const float cc = 1.0f / sqrtf(aspect * aspect + 1.0f) * lens->CropFactor / d->crop * arc;
+  const float norm = 2.0 / size * cc;
+  const float center_x = (width / size + lens->CenterX) * cc;
+  const float center_y = (height / size + lens->CenterY) * cc;
+  const gboolean reverse = d->inverse;
+
+  memset(lf, 0, sizeof(float) * 17);
+  memset(vig, 0, sizeof(float) * 8);
+  lf[0] = norm;
+  lf[1] = size * 0.5 / cc;
+  lf[2] = center_x;
+  lf[3] = center_y;
+  lf[5] = reverse;
+
+  if(modflags & LF_MODIFY_SCALE)
+  {
+    // a scale of 0 asks lensfun for its autoscale, which isn't ported
+    if(d->scale == 0.0f) return FALSE;
+    lf[4] = reverse ? d->scale : 1.0f / d->scale;
+  }
+
+  if(modflags & LF_MODIFY_DISTORTION)
+  {
+    lfLensCalibDistortion lcd;
+    if(!lens->InterpolateDistortion(d->focal, lcd)) return FALSE;
+    switch(lcd.Model)
+    {
+      case LF_DIST_MODEL_POLY3:
+        lf[6] = 1.0f;
+        // lensfun's inverse takes 1 / k1
+        lf[7] = reverse ? 1.0f / lcd.Terms[0] : lcd.Terms[0];
+        break;
+      case LF_DIST_MODEL_POLY5:
+        lf[6] = 2.0f;
+        lf[7] = lcd.Terms[0];
+        lf[8] = lcd.Terms[1];
+        break;
+      case LF_DIST_MODEL_PTLENS:
+        lf[6] = 3.0f;
+        lf[7] = lcd.Terms[0];
+        lf[8] = lcd.Terms[1];
+        lf[9] = lcd.Terms[2];
+        break;
+      default:
+        return FALSE;
+    }
+  }
+
+  if(modflags & LF_MODIFY_TCA)
+  {
+    lfLensCalibTCA lctca;
+    if(!lens->InterpolateTCA(d->focal, lctca)) return FALSE;
+    switch(lctca.Model)
+    {
+      case LF_TCA_MODEL_LINEAR:
+        lf[10] = 1.0f;
+        for(int k = 0; k < 2; k++)
+          lf[11 + k] = reverse ? 1.0f / lctca.Terms[k] : lctca.Terms[k];
+        break;
+      case LF_TCA_MODEL_POLY3:
+        lf[10] = 2.0f;
+        for(int k = 0; k < 6; k++) lf[11 + k] = lctca.Terms[k];
+        break;
+      default:
+        return FALSE;
+    }
+  }
+
+  if(modflags & LF_MODIFY_VIGNETTING)
+  {
+    lfLensCalibVignetting lcv;
+    if(!lens->InterpolateVignetting(d->focal, d->aperture, d->distance, lcv)
+       || lcv.Model != LF_VIGNETTING_MODEL_PA)
+      return FALSE;
+    vig[0] = norm;
+    vig[1] = center_x;
+    vig[2] = center_y;
+    for(int k = 0; k < 3; k++) vig[3 + k] = lcv.Terms[k];
+    vig[6] = 1.0f / arc;
+    vig[7] = reverse;
+  }
+  return TRUE;
+#endif
+}
+
+static int _process_slang_lf_model(dt_iop_module_t *self,
+                                   dt_dev_pixelpipe_iop_t *piece,
+                                   dt_slang_gpu_image_t *dev_in,
+                                   dt_slang_gpu_image_t *dev_out,
+                                   const dt_iop_roi_t *const roi_in,
+                                   const dt_iop_roi_t *const roi_out,
+                                   const int modflags,
+                                   const float lf[17],
+                                   const float vig[8],
+                                   const char *ldkernel)
+{
+  dt_iop_lens_data_t *d = (dt_iop_lens_data_t *)piece->data;
+  const gboolean pass_mode = piece->pipe->mask_display == DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  const int iwidth = roi_in->width;
+  const int iheight = roi_in->height;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+  const int roi_in_x = roi_in->x;
+  const int roi_in_y = roi_in->y;
+  const int roi_out_x = roi_out->x;
+  const int roi_out_y = roi_out->y;
+  const int do_nan_checks = d->do_nan_checks;
+  const gboolean distort = modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_SCALE);
+  const gboolean vignette = !pass_mode && (modflags & LF_MODIFY_VIGNETTING);
+
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(MAX(iwidth, owidth), MAX(iheight, oheight), 4, NULL);
+  if(!dev_tmp) return 1;
+
+  int err = 1;
+  if(d->inverse)
+  {
+    // reverse direction (useful for renderings)
+    if(distort)
+      err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
+                                     SLARG(roi_out_x), SLARG(roi_out_y), SLBUF(lf, sizeof(float) * 17),
+                                     SLARG(do_nan_checks));
+    else
+      err = _slang_copy(dev_in, dev_tmp, owidth, oheight);
+    if(err) goto error;
+
+    if(vignette)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_lf_vignette", owidth, oheight,
+                                     SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(roi_out_x), SLARG(roi_out_y), SLBUF(vig, sizeof(float) * 8));
+    else
+      err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
+  }
+  else // correct distortions:
+  {
+    if(vignette)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_lf_vignette", iwidth, iheight,
+                                     SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(iwidth), SLARG(iheight),
+                                     SLARG(roi_in_x), SLARG(roi_in_y), SLBUF(vig, sizeof(float) * 8));
+    else
+      err = _slang_copy(dev_in, dev_tmp, iwidth, iheight);
+    if(err) goto error;
+
+    if(distort)
+      err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
+                                     SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
+                                     SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
+                                     SLARG(roi_out_x), SLARG(roi_out_y), SLBUF(lf, sizeof(float) * 17),
+                                     SLARG(do_nan_checks));
+    else
+      err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
+  }
+
+error:
+  dt_slang_gpu_image_free(dev_tmp);
+  return err;
+}
+
 static int _process_slang_lf(dt_iop_module_t *self,
                              dt_dev_pixelpipe_iop_t *piece,
                              dt_slang_gpu_image_t *dev_in,
@@ -3280,19 +3467,24 @@ static int _process_slang_lf(dt_iop_module_t *self,
   if(piece->colors != ch) return 1;
 
   const char *ldkernel = NULL;
+  const char *lfkernel = NULL;
   switch(dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP)->id)
   {
     case DT_INTERPOLATION_BILINEAR:
       ldkernel = "lens_distort_bilinear";
+      lfkernel = "lens_lf_distort_bilinear";
       break;
     case DT_INTERPOLATION_BICUBIC:
       ldkernel = "lens_distort_bicubic";
+      lfkernel = "lens_lf_distort_bicubic";
       break;
     case DT_INTERPOLATION_LANCZOS2:
       ldkernel = "lens_distort_lanczos2";
+      lfkernel = "lens_lf_distort_lanczos2";
       break;
     case DT_INTERPOLATION_LANCZOS3:
       ldkernel = "lens_distort_lanczos3";
+      lfkernel = "lens_lf_distort_lanczos3";
       break;
     default:
       return 1;
@@ -3300,6 +3492,19 @@ static int _process_slang_lf(dt_iop_module_t *self,
 
   int err = 1;
   int modflags;
+
+  {
+    dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
+    lfModifier *mod = _get_modifier(&modflags, orig_w, orig_h, d, used_lf_mask, FALSE);
+    dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+    delete mod;
+
+    float lf[17], vig[8];
+    if(_slang_lf_model(d, modflags, orig_w, orig_h, lf, vig))
+      return _process_slang_lf_model(self, piece, dev_in, dev_out, roi_in, roi_out, modflags, lf, vig,
+                                     lfkernel);
+  }
+
   float *tmpbuf = (float *)dt_alloc_aligned(tmpbuflen);
   dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
   lfModifier *modifier = NULL;

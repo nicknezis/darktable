@@ -1051,6 +1051,233 @@ void lens_distort_lanczos3(uint3 gid : SV_DispatchThreadID,
   _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 0, 3, 3);
 }
 
+// lensfun's own models, evaluated per pixel instead of reading coordinates
+// that lensfun computed on the CPU. lf holds the model, filled by
+// _slang_lf_model() in src/iop/lens.cc:
+//  0-3   NormScale, NormUnScale, CenterX, CenterY (lfModifier's constructor)
+//  4     the coordinate scale (0 for none), 5 reverse
+//  6     distortion model (0 none, 1 poly3, 2 poly5, 3 ptlens), 7-9 its terms
+//  10    TCA model (0 none, 1 linear, 2 poly3), 11-16 its terms
+// The steps and their order follow lfModifier::ApplySubpixelGeometryDistortion()
+// in lensfun 0.3.4: scale, distortion, then TCA when correcting, and the
+// inverse functions with the scale last in reverse mode.
+static const float LF_NEWTON_EPS = 0.00001f;
+
+// Newton's method for ru in rd = ru * poly(ru), as lensfun's ModifyCoord_UnDist_*:
+// on no convergence or a negative radius the point stays where it was
+float2 _lf_undist(const float2 p, const int model, const float t0, const float t1, const float t2)
+{
+  const float rd = length(p);
+  if(rd == 0.0f) return p;
+  float ru = rd;
+  for(int step = 0; ; step++)
+  {
+    const float ru2 = ru * ru;
+    float fru, dfru;
+    if(model == 1)
+    {
+      // t0 is 1/k1, as lensfun stores it
+      const float a = (1.0f - 1.0f / t0) * t0;
+      fru = ru2 * ru + ru * a - rd * t0;
+      dfru = 3.0f * ru2 + a;
+    }
+    else if(model == 2)
+    {
+      fru = ru * (1.0f + t0 * ru2 + t1 * ru2 * ru2) - rd;
+      dfru = 1.0f + 3.0f * t0 * ru2 + 5.0f * t1 * ru2 * ru2;
+    }
+    else
+    {
+      const float d = 1.0f - t0 - t1 - t2;
+      fru = ru * (t0 * ru2 * ru + t1 * ru2 + t2 * ru + d) - rd;
+      dfru = 4.0f * t0 * ru2 * ru + 3.0f * t1 * ru2 + 2.0f * t2 * ru + d;
+    }
+    if(fru >= -LF_NEWTON_EPS && fru < LF_NEWTON_EPS) break;
+    if(step > 5) return p;
+    ru -= fru / dfru;
+  }
+  return ru < 0.0f ? p : p * (ru / rd);
+}
+
+float2 _lf_dist(const float2 p, const int model, const float t0, const float t1, const float t2)
+{
+  const float ru2 = dot(p, p);
+  if(model == 1) return p * (1.0f - t0 + t0 * ru2);
+  if(model == 2) return p * (1.0f + t0 * ru2 + t1 * ru2 * ru2);
+  const float r = sqrt(ru2);
+  return p * (t0 * ru2 * r + t1 * ru2 + t2 * r + 1.0f - t0 - t1 - t2);
+}
+
+// TCA for one of red (c = 0) or blue (c = 1), as ModifyCoord_TCA_* and _UnTCA_*
+float2 _lf_tca(const float2 p, StructuredBuffer<float> lf, const int c, const bool reverse)
+{
+  const int model = int(lf[10]);
+  if(model == 1) return p * lf[11 + c];
+  const float v = lf[11 + c];
+  const float cc = lf[13 + c];
+  const float b = lf[15 + c];
+  if(!reverse)
+  {
+    const float ru2 = dot(p, p);
+    return p * (b * ru2 + cc * sqrt(ru2) + v);
+  }
+  const float rd = length(p);
+  if(rd == 0.0f) return p;
+  float ru = rd;
+  for(int step = 0; ; step++)
+  {
+    const float ru2 = ru * ru;
+    const float fru = b * ru2 * ru + cc * ru2 + v * ru - rd;
+    if(fru >= -LF_NEWTON_EPS && fru < LF_NEWTON_EPS) break;
+    if(step > 5) return p;
+    ru -= fru / (3.0f * b * ru2 + 2.0f * cc * ru + v);
+  }
+  return ru > 0.0f ? p * (ru / rd) : p;
+}
+
+void _lens_lf_coords(StructuredBuffer<float> lf, const int x, const int y, out float c[6])
+{
+  const float norm = lf[0];
+  const float unnorm = lf[1];
+  const float2 center = float2(lf[2], lf[3]);
+  const float scale = lf[4];
+  const bool reverse = lf[5] != 0.0f;
+  const int dmodel = int(lf[6]);
+
+  float2 p = float2(float(x), float(y)) * norm - center;
+  if(!reverse)
+  {
+    if(scale != 0.0f) p *= scale;
+    if(dmodel != 0) p = _lf_dist(p, dmodel, lf[7], lf[8], lf[9]);
+  }
+  else
+  {
+    if(dmodel != 0) p = _lf_undist(p, dmodel, lf[7], lf[8], lf[9]);
+    if(scale != 0.0f) p *= scale;
+  }
+
+  float2 r = p;
+  float2 b = p;
+  if(int(lf[10]) != 0)
+  {
+    r = _lf_tca(p, lf, 0, reverse);
+    b = _lf_tca(p, lf, 1, reverse);
+  }
+  r = (r + center) * unnorm;
+  const float2 g = (p + center) * unnorm;
+  b = (b + center) * unnorm;
+  c[0] = r.x; c[1] = r.y;
+  c[2] = g.x; c[3] = g.y;
+  c[4] = b.x; c[5] = b.y;
+}
+
+void _lens_lf_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
+                      const int iwidth, const int iheight, const int roi_in_x, const int roi_in_y,
+                      const int roi_out_x, const int roi_out_y, StructuredBuffer<float> lf,
+                      const int do_nan_checks, const int bilinear, const int kwidth, const int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float c[6];
+  _lens_lf_coords(lf, roi_out_x + x, roi_out_y + y, c);
+
+  bool valid = true;
+  for(int n = 0; n < 6; n++) valid = valid && isfinite(c[n]);
+  if(do_nan_checks != 0 && !valid)
+  {
+    out.write(int2(x, y), float4(0.0f));
+    return;
+  }
+
+  float4 pixel = float4(0.0f);
+  for(int ch = 0; ch < 3; ch++)
+  {
+    const float rx = c[2 * ch] - float(roi_in_x);
+    const float ry = c[2 * ch + 1] - float(roi_in_y);
+    const float4 px = bilinear != 0 ? _lens_bilinear(in, rx, ry, iwidth, iheight)
+                                    : _lens_filter(in, rx, ry, kwidth, lanczos, ch == 2 && lanczos == 0, iwidth, iheight);
+    // green carries the mask along
+    if(ch == 0) pixel.x = px.x;
+    else if(ch == 1) pixel.yw = px.yw;
+    else pixel.z = px.z;
+  }
+
+  pixel = all(isfinite(pixel.xyz)) ? pixel : float4(0.0f);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_lf_distort_bilinear(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                              uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                              uniform int roi_out_x, uniform int roi_out_y, uniform StructuredBuffer<float> lf,
+                              uniform int do_nan_checks)
+{
+  _lens_lf_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y,
+                   roi_out_x, roi_out_y, lf, do_nan_checks, 1, 1, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_lf_distort_bicubic(uint3 gid : SV_DispatchThreadID,
+                             uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                             uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                             uniform int roi_out_x, uniform int roi_out_y, uniform StructuredBuffer<float> lf,
+                             uniform int do_nan_checks)
+{
+  _lens_lf_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y,
+                   roi_out_x, roi_out_y, lf, do_nan_checks, 0, 2, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_lf_distort_lanczos2(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                              uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                              uniform int roi_out_x, uniform int roi_out_y, uniform StructuredBuffer<float> lf,
+                              uniform int do_nan_checks)
+{
+  _lens_lf_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y,
+                   roi_out_x, roi_out_y, lf, do_nan_checks, 0, 2, 2);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_lf_distort_lanczos3(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                              uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                              uniform int roi_out_x, uniform int roi_out_y, uniform StructuredBuffer<float> lf,
+                              uniform int do_nan_checks)
+{
+  _lens_lf_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y,
+                   roi_out_x, roi_out_y, lf, do_nan_checks, 0, 3, 3);
+}
+
+// lensfun's PA vignetting model, as ModifyColor_DeVignetting_PA (and
+// _Vignetting_PA in reverse mode). lf holds NormScale, CenterX, CenterY, the
+// three terms, 1 / AspectRatioCorrection and reverse.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_lf_vignette(uint3 gid : SV_DispatchThreadID,
+                      uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                      uniform int roi_x, uniform int roi_y, uniform StructuredBuffer<float> lf)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float2 p = (float2(float(roi_x + x), float(roi_y + y)) * lf[0] - float2(lf[1], lf[2])) * lf[6];
+  const float r2 = dot(p, p);
+  const float r4 = r2 * r2;
+  const float v = 1.0f + lf[3] * r2 + lf[4] * r4 + lf[5] * r4 * r2;
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.xyz *= lf[7] != 0.0f ? v : 1.0f / v;
+  out.write(int2(x, y), pixel);
+}
+
 float _calc_vignette_spline(const float radius, StructuredBuffer<float> spline, const int splinesize)
 {
   if(radius >= 1.0f) return spline[splinesize - 1];
