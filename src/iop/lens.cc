@@ -244,6 +244,8 @@ typedef struct dt_iop_lens_data_t
   float reserved[2];
   float vigspline[VIGSPLINES];
   dt_hash_t vighash;
+  // dt_iop_lens_slang_cache_t, the lensfun grids of the Slang path
+  void *slang_cache;
 } dt_iop_lens_data_t;
 
 
@@ -3235,6 +3237,137 @@ static int _slang_copy(dt_slang_gpu_image_t *src,
                                   SLARG(iwidth), SLARG(iheight), SLARG(zero), SLARG(zero));
 }
 
+// the Slang path asks lensfun for its coordinates and vignetting factors only
+// on a grid of every step-th pixel, and the kernels interpolate between the
+// points. Lensfun per pixel cost seconds on a slow CPU and a 232 MB upload for
+// 10 MP. A grid is accepted when the interpolation at sampled cell centers
+// stays within the tolerance of lensfun's own values; otherwise the step is
+// halved, down to 1, which is the exact per-pixel buffer.
+// Each point is its own lensfun call, which runs lensfun's scalar code. On x86
+// the CPU path's whole rows go through lensfun's SSE PTLens distortion instead,
+// whose approximate square root is up to ~0.3 px off, so the two paths differ
+// by that much there.
+#define LENS_GRID_STEP 8
+#define LENS_GRID_TOL_COORD 0.01f
+#define LENS_GRID_TOL_VIG 1e-4f
+
+typedef struct dt_iop_lens_slang_grid_t
+{
+  float *data;
+  int step;
+  int gwidth;
+} dt_iop_lens_slang_grid_t;
+
+// the grids of the last run, kept while the pipe area and the lensfun
+// setup stay the same. commit_params() drops them.
+typedef struct dt_iop_lens_slang_cache_t
+{
+  dt_iop_roi_t roi_in;
+  dt_iop_roi_t roi_out;
+  float orig_w;
+  float orig_h;
+  int lf_mask;
+  gboolean pass_mode;
+  int modflags;
+  dt_iop_lens_slang_grid_t coords;
+  dt_iop_lens_slang_grid_t vig;
+} dt_iop_lens_slang_cache_t;
+
+static void _slang_cache_free(dt_iop_lens_data_t *d)
+{
+  dt_iop_lens_slang_cache_t *c = (dt_iop_lens_slang_cache_t *)d->slang_cache;
+  if(!c) return;
+  dt_free_align(c->coords.data);
+  dt_free_align(c->vig.data);
+  free(c);
+  d->slang_cache = NULL;
+}
+
+static inline void _slang_grid_eval(lfModifier *modifier,
+                                    const gboolean vig,
+                                    const int x,
+                                    const int y,
+                                    float *out)
+{
+  if(vig)
+  {
+    for(int k = 0; k < 4; k++) out[k] = 0.5f;
+    modifier->ApplyColorModification(out, x, y, 1, 1, LF_CR_4(RED, GREEN, BLUE, UNKNOWN), 4);
+  }
+  else
+    modifier->ApplySubpixelGeometryDistortion(x, y, 1, 1, out);
+}
+
+static gboolean _slang_grid_build(lfModifier *modifier,
+                                  const gboolean vig,
+                                  const int x0,
+                                  const int y0,
+                                  const int width,
+                                  const int height,
+                                  dt_iop_lens_slang_grid_t *grid)
+{
+  const int stride = vig ? 4 : 6;
+  const int count = vig ? 3 : 6;
+  const float tol = vig ? LENS_GRID_TOL_VIG : LENS_GRID_TOL_COORD;
+
+  for(int step = LENS_GRID_STEP; step >= 1; step /= 2)
+  {
+    const int gw = (width - 1) / step + 2;
+    const int gh = (height - 1) / step + 2;
+    float *data = dt_alloc_align_float((size_t)gw * gh * stride);
+    if(!data) return FALSE;
+
+    int finite = 1;
+    DT_OMP_FOR(reduction(&&: finite))
+    for(int j = 0; j < gh; j++)
+      for(int i = 0; i < gw; i++)
+      {
+        float *p = data + ((size_t)j * gw + i) * stride;
+        _slang_grid_eval(modifier, vig, x0 + i * step, y0 + j * step, p);
+        for(int n = 0; n < count; n++) finite = finite && isfinite(p[n]);
+      }
+
+    // non-finite coordinates mark pixels lensfun can't map, and
+    // interpolating would spread them over whole cells
+    if(step > 1 && finite)
+    {
+      float err = 0.0f;
+      DT_OMP_FOR(reduction(max: err))
+      for(int j = 0; j < gh - 1; j += 4)
+        for(int i = 0; i < gw - 1; i += 4)
+        {
+          float exact[6];
+          _slang_grid_eval(modifier, vig, x0 + i * step + step / 2, y0 + j * step + step / 2, exact);
+          const float *p00 = data + ((size_t)j * gw + i) * stride;
+          const float *p01 = p00 + (size_t)gw * stride;
+          for(int n = 0; n < count; n++)
+          {
+            const float mid = 0.25f * (p00[n] + p00[stride + n] + p01[n] + p01[stride + n]);
+            const float e = fabsf(mid - exact[n]);
+            err = isfinite(e) ? fmaxf(err, e) : INFINITY;
+          }
+        }
+      if(err > tol)
+      {
+        dt_free_align(data);
+        continue;
+      }
+    }
+    else if(step > 1)
+    {
+      dt_free_align(data);
+      step = 2;
+      continue;
+    }
+
+    grid->data = data;
+    grid->step = step;
+    grid->gwidth = gw;
+    return TRUE;
+  }
+  return FALSE;
+}
+
 static int _process_slang_lf(dt_iop_module_t *self,
                              dt_dev_pixelpipe_iop_t *piece,
                              dt_slang_gpu_image_t *dev_in,
@@ -3258,15 +3391,6 @@ static int _process_slang_lf(dt_iop_module_t *self,
   const int roi_in_y = roi_in->y;
   const int width = MAX(iwidth, owidth);
   const int height = MAX(iheight, oheight);
-  // lens_vignette reads four factors per pixel
-  const int ch = 4;
-  const int tmpbufwidth = owidth * 2 * 3;
-  const size_t tmpbufsize = (size_t)tmpbufwidth * oheight * sizeof(float);
-  const size_t tmpbuflen = d->inverse
-    ? (size_t)oheight * owidth * 2 * 3 * sizeof(float)
-    : MAX((size_t)oheight * owidth * 2 * 3,
-          (size_t)iheight * iwidth * ch) * sizeof(float);
-  const unsigned int pixelformat = LF_CR_4(RED, GREEN, BLUE, UNKNOWN);
   const int do_nan_checks = d->do_nan_checks;
 
   const float orig_w = roi_in->scale * piece->buf_in.width;
@@ -3277,123 +3401,135 @@ static int _process_slang_lf(dt_iop_module_t *self,
     dt_print_pipe(DT_DEBUG_PIPE, "lensfun bypass", piece->pipe, self, DT_DEVICE_NONE, roi_in, roi_out);
     return _slang_copy(dev_in, dev_out, owidth, oheight);
   }
-  if(piece->colors != ch) return 1;
+  if(piece->colors != 4) return 1;
 
   const char *ldkernel = NULL;
   switch(dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP)->id)
   {
     case DT_INTERPOLATION_BILINEAR:
-      ldkernel = "lens_distort_bilinear";
+      ldkernel = "lens_distort_grid_bilinear";
       break;
     case DT_INTERPOLATION_BICUBIC:
-      ldkernel = "lens_distort_bicubic";
+      ldkernel = "lens_distort_grid_bicubic";
       break;
     case DT_INTERPOLATION_LANCZOS2:
-      ldkernel = "lens_distort_lanczos2";
+      ldkernel = "lens_distort_grid_lanczos2";
       break;
     case DT_INTERPOLATION_LANCZOS3:
-      ldkernel = "lens_distort_lanczos3";
+      ldkernel = "lens_distort_grid_lanczos3";
       break;
     default:
       return 1;
   }
 
-  int err = 1;
-  int modflags;
-  float *tmpbuf = (float *)dt_alloc_aligned(tmpbuflen);
-  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
-  lfModifier *modifier = NULL;
-  if(!tmpbuf || !dev_tmp) goto error;
+  dt_iop_lens_slang_cache_t *c = (dt_iop_lens_slang_cache_t *)d->slang_cache;
+  if(c
+     && (memcmp(&c->roi_in, roi_in, sizeof(dt_iop_roi_t))
+         || memcmp(&c->roi_out, roi_out, sizeof(dt_iop_roi_t))
+         || c->orig_w != orig_w || c->orig_h != orig_h || c->lf_mask != used_lf_mask
+         || c->pass_mode != pass_mode))
+  {
+    _slang_cache_free(d);
+    c = NULL;
+  }
 
-  dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
-  modifier = _get_modifier(&modflags, orig_w, orig_h, d, used_lf_mask, FALSE);
-  dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+  if(!c)
+  {
+    const double start = dt_get_wtime();
+    c = (dt_iop_lens_slang_cache_t *)calloc(1, sizeof(dt_iop_lens_slang_cache_t));
+    if(!c) return 1;
+    c->roi_in = *roi_in;
+    c->roi_out = *roi_out;
+    c->orig_w = orig_w;
+    c->orig_h = orig_h;
+    c->lf_mask = used_lf_mask;
+    c->pass_mode = pass_mode;
+
+    dt_pthread_mutex_lock(&darktable.plugin_threadsafe);
+    lfModifier *modifier = _get_modifier(&c->modflags, orig_w, orig_h, d, used_lf_mask, FALSE);
+    dt_pthread_mutex_unlock(&darktable.plugin_threadsafe);
+
+    gboolean ok = TRUE;
+    if(c->modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
+      ok = _slang_grid_build(modifier, FALSE, roi_out->x, roi_out->y, owidth, oheight, &c->coords);
+    // the vignetting correction comes after the distortion in reverse
+    // mode and before it otherwise
+    if(ok && !pass_mode && (c->modflags & LF_MODIFY_VIGNETTING))
+    {
+      const dt_iop_roi_t *vroi = d->inverse ? roi_out : roi_in;
+      ok = _slang_grid_build(modifier, TRUE, vroi->x, vroi->y, vroi->width, vroi->height, &c->vig);
+    }
+    delete modifier;
+
+    d->slang_cache = c;
+    if(!ok)
+    {
+      _slang_cache_free(d);
+      return 1;
+    }
+    dt_print(DT_DEBUG_PERF, "[lens] lensfun grid step %d, vignetting step %d took %.3f secs",
+             c->coords.step, c->vig.step, dt_get_wtime() - start);
+  }
+
+  const int coord_step = c->coords.step;
+  const int coord_gwidth = c->coords.gwidth;
+  const size_t coord_size = c->coords.data
+    ? sizeof(float) * 6 * coord_gwidth * ((oheight - 1) / coord_step + 2)
+    : 0;
+  const int vig_step = c->vig.step;
+  const int vig_gwidth = c->vig.gwidth;
+  const int vig_height = d->inverse ? oheight : iheight;
+  const size_t vig_size = c->vig.data
+    ? sizeof(float) * 4 * vig_gwidth * ((vig_height - 1) / MAX(vig_step, 1) + 2)
+    : 0;
+
+  int err = 1;
+  dt_slang_gpu_image_t *dev_tmp = dt_slang_gpu_image_new(width, height, 4, NULL);
+  if(!dev_tmp) return 1;
 
   if(d->inverse)
   {
     // reverse direction (useful for renderings)
-    if(modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
-    {
-      DT_OMP_FOR(shared(tmpbuf, d, modifier))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *pi = tmpbuf + (size_t)y * tmpbufwidth;
-        modifier->ApplySubpixelGeometryDistortion(roi_out->x, roi_out->y + y, roi_out->width, 1, pi);
-      }
-
+    if(c->coords.data)
       err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
                                      SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(owidth), SLARG(oheight),
                                      SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
-                                     SLBUF(tmpbuf, tmpbufsize), SLARG(do_nan_checks));
-    }
+                                     SLBUF(c->coords.data, coord_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
     else
       err = _slang_copy(dev_in, dev_tmp, owidth, oheight);
     if(err) goto error;
 
-    if(!pass_mode && (modflags & LF_MODIFY_VIGNETTING))
-    {
-      DT_OMP_FOR(shared(tmpbuf, modifier, d))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *buf = tmpbuf + (size_t)y * ch * roi_out->width;
-        for(int k = 0; k < ch * roi_out->width; k++) buf[k] = 0.5f;
-        modifier->ApplyColorModification(buf, roi_out->x, roi_out->y + y, roi_out->width, 1,
-                                         pixelformat, ch * roi_out->width);
-      }
-
-      const size_t bsize = (size_t)ch * roi_out->width * roi_out->height * sizeof(float);
-      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", owidth, oheight,
+    if(c->vig.data)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette_grid", owidth, oheight,
                                      SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
-                                     SLBUF(tmpbuf, bsize));
-    }
+                                     SLBUF(c->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
     else
       err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
   }
   else // correct distortions:
   {
-    if(!pass_mode && (modflags & LF_MODIFY_VIGNETTING))
-    {
-      DT_OMP_FOR(shared(tmpbuf, modifier, d))
-      for(int y = 0; y < roi_in->height; y++)
-      {
-        float *buf = tmpbuf + (size_t)y * ch * roi_in->width;
-        for(int k = 0; k < ch * roi_in->width; k++) buf[k] = 0.5f;
-        modifier->ApplyColorModification(buf, roi_in->x, roi_in->y + y, roi_in->width, 1,
-                                         pixelformat, ch * roi_in->width);
-      }
-
-      const size_t bsize = (size_t)ch * roi_in->width * roi_in->height * sizeof(float);
-      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette", iwidth, iheight,
+    if(c->vig.data)
+      err = dt_slang_gpu_run_2d_args("basic", "lens_vignette_grid", iwidth, iheight,
                                      SLIMG_DEV(dev_in), SLIMG_DEV(dev_tmp), SLARG(iwidth), SLARG(iheight),
-                                     SLBUF(tmpbuf, bsize));
-    }
+                                     SLBUF(c->vig.data, vig_size), SLARG(vig_step), SLARG(vig_gwidth));
     else
       err = _slang_copy(dev_in, dev_tmp, iwidth, iheight);
     if(err) goto error;
 
-    if(modflags & (LF_MODIFY_TCA | LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY | LF_MODIFY_SCALE))
-    {
-      DT_OMP_FOR(shared(tmpbuf, d, modifier))
-      for(int y = 0; y < roi_out->height; y++)
-      {
-        float *pi = tmpbuf + (size_t)y * tmpbufwidth;
-        modifier->ApplySubpixelGeometryDistortion(roi_out->x, roi_out->y + y, roi_out->width, 1, pi);
-      }
-
+    if(c->coords.data)
       err = dt_slang_gpu_run_2d_args("basic", ldkernel, owidth, oheight,
                                      SLIMG_DEV(dev_tmp), SLIMG_DEV(dev_out), SLARG(owidth), SLARG(oheight),
                                      SLARG(iwidth), SLARG(iheight), SLARG(roi_in_x), SLARG(roi_in_y),
-                                     SLBUF(tmpbuf, tmpbufsize), SLARG(do_nan_checks));
-    }
+                                     SLBUF(c->coords.data, coord_size), SLARG(do_nan_checks),
+                                     SLARG(coord_step), SLARG(coord_gwidth));
     else
       err = _slang_copy(dev_tmp, dev_out, owidth, oheight);
   }
 
 error:
-  // SLBUF copies tmpbuf to the device when the kernel is started
+  // SLBUF copies the grids to the device when the kernel is started
   dt_slang_gpu_image_free(dev_tmp);
-  dt_free_align(tmpbuf);
-  if(modifier != NULL) delete modifier;
   return err;
 }
 
@@ -3660,6 +3796,10 @@ void commit_params(dt_iop_module_t *self,
   d->v_radius = p->v_radius;
   d->v_steepness = p->v_steepness;
 
+#ifdef HAVE_SLANG_GPU
+  _slang_cache_free(d);
+#endif
+
   piece->process_cl_ready = TRUE;
 
   if(d->method == DT_IOP_LENS_METHOD_LENSFUN)
@@ -3692,6 +3832,9 @@ void cleanup_pipe(dt_iop_module_t *self,
     delete d->lens;
     d->lens = NULL;
   }
+#ifdef HAVE_SLANG_GPU
+  _slang_cache_free(d);
+#endif
 
   free(piece->data);
   piece->data = NULL;

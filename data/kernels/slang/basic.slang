@@ -1051,6 +1051,120 @@ void lens_distort_lanczos3(uint3 gid : SV_DispatchThreadID,
   _lens_distort(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks, 0, 3, 3);
 }
 
+// lens_distort_grid_* take the lensfun coordinates on a grid of every step-th
+// output pixel, gwidth points to a row, and interpolate them bilinearly. A
+// weight of zero skips its neighbor, so step 1 reads the exact coordinates and
+// a non-finite neighbor doesn't leak into a pixel that sits on a grid point.
+float _lens_grid_lerp(const float a, const float b, const float t)
+{
+  return t > 0.0f ? a + t * (b - a) : a;
+}
+
+void _lens_grid_coords(StructuredBuffer<float> pi, const int x, const int y,
+                       const int step, const int gwidth, const int stride, const int count, out float c[6])
+{
+  const int i = x / step;
+  const int j = y / step;
+  const float tx = float(x - i * step) / float(step);
+  const float ty = float(y - j * step) / float(step);
+  const int k00 = (j * gwidth + i) * stride;
+  const int k10 = k00 + stride;
+  const int k01 = k00 + gwidth * stride;
+  const int k11 = k01 + stride;
+  for(int n = 0; n < 6; n++) c[n] = 0.0f;
+  for(int n = 0; n < count; n++)
+  {
+    const float top = _lens_grid_lerp(pi[k00 + n], tx > 0.0f ? pi[k10 + n] : 0.0f, tx);
+    const float bottom = ty > 0.0f ? _lens_grid_lerp(pi[k01 + n], tx > 0.0f ? pi[k11 + n] : 0.0f, tx) : 0.0f;
+    c[n] = _lens_grid_lerp(top, bottom, ty);
+  }
+}
+
+void _lens_distort_grid(const uint3 gid, ImageIn in, ImageOut out, const int width, const int height,
+                        const int iwidth, const int iheight, const int roi_in_x, const int roi_in_y,
+                        StructuredBuffer<float> pi, const int do_nan_checks, const int step, const int gwidth,
+                        const int bilinear, const int kwidth, const int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float c[6];
+  _lens_grid_coords(pi, x, y, step, gwidth, 6, 6, c);
+
+  bool valid = true;
+  for(int n = 0; n < 6; n++) valid = valid && isfinite(c[n]);
+  if(do_nan_checks != 0 && !valid)
+  {
+    out.write(int2(x, y), float4(0.0f));
+    return;
+  }
+
+  float4 pixel = float4(0.0f);
+  for(int ch = 0; ch < 3; ch++)
+  {
+    const float rx = c[2 * ch] - float(roi_in_x);
+    const float ry = c[2 * ch + 1] - float(roi_in_y);
+    const float4 px = bilinear != 0 ? _lens_bilinear(in, rx, ry, iwidth, iheight)
+                                    : _lens_filter(in, rx, ry, kwidth, lanczos, ch == 2 && lanczos == 0, iwidth, iheight);
+    // green carries the mask along
+    if(ch == 0) pixel.x = px.x;
+    else if(ch == 1) pixel.yw = px.yw;
+    else pixel.z = px.z;
+  }
+
+  pixel = all(isfinite(pixel.xyz)) ? pixel : float4(0.0f);
+  out.write(int2(x, y), pixel);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_grid_bilinear(uint3 gid : SV_DispatchThreadID,
+                                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                                uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                                uniform StructuredBuffer<float> pi, uniform int do_nan_checks, uniform int step,
+                                uniform int gwidth)
+{
+  _lens_distort_grid(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks,
+                     step, gwidth, 1, 1, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_grid_bicubic(uint3 gid : SV_DispatchThreadID,
+                               uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                               uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                               uniform StructuredBuffer<float> pi, uniform int do_nan_checks, uniform int step,
+                               uniform int gwidth)
+{
+  _lens_distort_grid(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks,
+                     step, gwidth, 0, 2, 0);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_grid_lanczos2(uint3 gid : SV_DispatchThreadID,
+                                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                                uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                                uniform StructuredBuffer<float> pi, uniform int do_nan_checks, uniform int step,
+                                uniform int gwidth)
+{
+  _lens_distort_grid(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks,
+                     step, gwidth, 0, 2, 2);
+}
+
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_distort_grid_lanczos3(uint3 gid : SV_DispatchThreadID,
+                                uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                                uniform int iwidth, uniform int iheight, uniform int roi_in_x, uniform int roi_in_y,
+                                uniform StructuredBuffer<float> pi, uniform int do_nan_checks, uniform int step,
+                                uniform int gwidth)
+{
+  _lens_distort_grid(gid, in, out, width, height, iwidth, iheight, roi_in_x, roi_in_y, pi, do_nan_checks,
+                     step, gwidth, 0, 3, 3);
+}
+
 float _calc_vignette_spline(const float radius, StructuredBuffer<float> spline, const int splinesize)
 {
   if(radius >= 1.0f) return spline[splinesize - 1];
@@ -1141,6 +1255,25 @@ void lens_vignette(uint3 gid : SV_DispatchThreadID,
   const int k = 4 * (y * width + x);
   const float3 scale = 2.0f * float3(pi[k], pi[k + 1], pi[k + 2]);
   pixel.xyz *= scale;
+  out.write(int2(x, y), pixel);
+}
+
+// lens_vignette with the factors on a grid of every step-th pixel, four floats
+// to a point, interpolated as in _lens_grid_coords()
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void lens_vignette_grid(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                        uniform StructuredBuffer<float> pi, uniform int step, uniform int gwidth)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float c[6];
+  _lens_grid_coords(pi, x, y, step, gwidth, 4, 3, c);
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.xyz *= 2.0f * float3(c[0], c[1], c[2]);
   out.write(int2(x, y), pixel);
 }
 
