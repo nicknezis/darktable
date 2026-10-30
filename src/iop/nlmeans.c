@@ -227,11 +227,16 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   cl_mem dev_U2 = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * width * height);
   if(dev_U2 == NULL) goto error;
 
+  // the patch distances are computed over the image extended by mirroring, as on the CPU
+  const int border = K + P;
+  const int pwidth = width + 2 * border;
+  const int pheight = height + 2 * border;
+
   cl_mem buckets[NUM_BUCKETS] = { NULL };
   unsigned int state = 0;
   for(int k = 0; k < NUM_BUCKETS; k++)
   {
-    buckets[k] = dt_opencl_alloc_device_buffer(devid, sizeof(float) * width * height);
+    buckets[k] = dt_opencl_alloc_device_buffer(devid, sizeof(float) * pwidth * pheight);
     if(buckets[k] == NULL) goto error;
   }
 
@@ -263,45 +268,47 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   err = dt_opencl_fill_buffer(devid, dev_U2, (size_t)width * height, 4, 0.0f);
   if(err != CL_SUCCESS) goto error;
 
-  const size_t bwidth = ROUNDUP(width, hblocksize);
-  const size_t bheight = ROUNDUP(height, vblocksize);
+  const size_t bwidth = ROUNDUP(pwidth, hblocksize);
+  const size_t bheight = ROUNDUP(pheight, vblocksize);
 
+  // each pass also adds the mirrored offset -q, so the row j = 0 stops at
+  // i = 0: its right half is the mirror of its left half
   for(int j = -K; j <= 0; j++)
-    for(int i = -K; i <= K; i++)
+    for(int i = -K; i <= (j < 0 ? K : 0); i++)
     {
       const int q[2] = { i, j };
 
       cl_mem dev_U4 = buckets[bucket_next(&state, NUM_BUCKETS)];
 
-      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_dist, width, height,
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_dist, pwidth, pheight,
         CLARG(dev_in), CLARG(dev_U4), CLARG(width),
-        CLARG(height), CLARG(q), CLARG(nL2), CLARG(nC2));
+        CLARG(height), CLARG(q), CLARG(nL2), CLARG(nC2), CLARG(border));
       if(err != CL_SUCCESS) goto error;
 
       sizesl[0] = bwidth;
-      sizesl[1] = ROUNDUPDHT(height, devid);
+      sizesl[1] = ROUNDUPDHT(pheight, devid);
       local[0] = hblocksize;
       local[1] = 1;
       cl_mem dev_U4_t = buckets[bucket_next(&state, NUM_BUCKETS)];
       err = dt_opencl_enqueue_kernel_2d_local_args(devid, gd->kernel_nlmeans_horiz, sizesl, local,
-        CLARG(dev_U4), CLARG(dev_U4_t), CLARG(width),
-        CLARG(height), CLARG(q), CLARG(P), CLLOCAL((hblocksize + 2 * P) * sizeof(float)));
+        CLARG(dev_U4), CLARG(dev_U4_t), CLARG(pwidth),
+        CLARG(pheight), CLARG(q), CLARG(P), CLLOCAL((hblocksize + 2 * P) * sizeof(float)));
       if(err != CL_SUCCESS) goto error;
 
 
-      sizesl[0] = ROUNDUPDWD(width, devid);
+      sizesl[0] = ROUNDUPDWD(pwidth, devid);
       sizesl[1] = bheight;
       local[0] = 1;
       local[1] = vblocksize;
       cl_mem dev_U4_tt = buckets[bucket_next(&state, NUM_BUCKETS)];
       err = dt_opencl_enqueue_kernel_2d_local_args(devid, gd->kernel_nlmeans_vert, sizesl, local,
         CLARG(dev_U4_t), CLARG(dev_U4_tt),
-        CLARG(width), CLARG(height), CLARG(q), CLARG(P), CLARG(sharpness), CLLOCAL((vblocksize + 2 * P) * sizeof(float)));
+        CLARG(pwidth), CLARG(pheight), CLARG(q), CLARG(P), CLARG(sharpness), CLLOCAL((vblocksize + 2 * P) * sizeof(float)));
       if(err != CL_SUCCESS) goto error;
 
       err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_nlmeans_accu, width, height,
         CLARG(dev_in), CLARG(dev_U2), CLARG(dev_U4_tt),
-        CLARG(width), CLARG(height), CLARG(q));
+        CLARG(width), CLARG(height), CLARG(q), CLARG(border));
       if(err != CL_SUCCESS) goto error;
 
       dt_opencl_finish_sync_pipe(devid, piece->pipe->type);
@@ -350,13 +357,16 @@ gboolean process_slang(dt_iop_module_t *self,
   // the steps of the old process_cl() code; dt_slang_gpu_buffer_new() zeroes
   // the accumulator. Each pass adds the patches at q and -q, so the passes
   // cover the half of the search window with j < 0, and of the row j = 0 the
-  // part with i <= 0, so that every patch counts once, as in
-  // nlmeans_denoise(). process_cl() runs all of row 0 and counts its patches
-  // twice.
+  // part with i <= 0, so that every patch counts once. The patch distances
+  // are computed over the image extended by mirroring, as on the CPU.
+  const int border = K + P;
+  const int pwidth = width + 2 * border;
+  const int pheight = height + 2 * border;
+  const size_t ppixels = (size_t)pwidth * pheight;
   dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
-  dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
-  dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
-  dt_slang_gpu_buffer_t *dev_U4_tt = dt_slang_gpu_buffer_new_uninit(sizeof(float) * npixels);
+  dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
+  dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
+  dt_slang_gpu_buffer_t *dev_U4_tt = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
 
   int err = !dev_U2 || !dev_U4 || !dev_U4_t || !dev_U4_tt;
 
@@ -364,18 +374,18 @@ gboolean process_slang(dt_iop_module_t *self,
     for(int i = -K; i <= (j < 0 ? K : 0) && !err; i++)
     {
       const int q[2] = { i, j };
-      err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_dist", width, height,
+      err = dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_dist", pwidth, pheight,
                                      SLIMG_DEV(dev_in), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height),
-                                     SLARG(q), SLARG(nL2), SLARG(nC2))
-        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_horiz", width, height,
-                                    SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(width), SLARG(height),
+                                     SLARG(q), SLARG(nL2), SLARG(nC2), SLARG(border))
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_horiz", pwidth, pheight,
+                                    SLBUF_DEV(dev_U4), SLBUF_DEV(dev_U4_t), SLARG(pwidth), SLARG(pheight),
                                     SLARG(P))
-        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_vert", width, height,
-                                    SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(width), SLARG(height),
+        || dt_slang_gpu_run_2d_args("nlmeans", "nlmeans_vert", pwidth, pheight,
+                                    SLBUF_DEV(dev_U4_t), SLBUF_DEV(dev_U4_tt), SLARG(pwidth), SLARG(pheight),
                                     SLARG(P), SLARG(sharpness))
         || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
                                     SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
-                                    SLARG(width), SLARG(height), SLARG(q));
+                                    SLARG(width), SLARG(height), SLARG(q), SLARG(border));
     }
 
   // normalize and blend
@@ -400,7 +410,7 @@ void tiling_callback(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece,
   const int P = ceilf(d->radius * fmin(roi_in->scale, 2.0f) / fmax(piece->iscale, 1.0f)); // pixel filter size
   const int K = ceilf(7 * fmin(roi_in->scale, 2.0f) / fmax(piece->iscale, 1.0f));         // nbhood
 
-  tiling->factor = 2.0f + 1.0f + 0.25 * NUM_BUCKETS; // in + out + tmp
+  tiling->factor = 4.0f + 1.0f + 0.25 * NUM_BUCKETS; // in + out + tmp + mirror-extended in and out
   tiling->maxbuf = 1.0f;
   tiling->overhead = 0;
   tiling->overlap = P + K;
