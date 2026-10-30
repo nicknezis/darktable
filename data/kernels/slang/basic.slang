@@ -365,6 +365,178 @@ void highlights_1f_clip(uint3 gid : SV_DispatchThreadID,
   out.write(int2(x, y), float4(pixel));
 }
 
+// highlights on demosaiced images, which only clips
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_4f_clip(uint3 gid : SV_DispatchThreadID,
+                        uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                        uniform float clip)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float4 pixel = in.Areadpixel(x, y);
+  pixel.xyz = min(float3(clip), pixel.xyz);
+  out.write(int2(x, y), pixel);
+}
+
+static const float HL_FLT_MAX = 3.402823466e+38f;
+static const float HL_SQRT3 = 1.7320508075688772935274463415058723669f;
+static const float HL_SQRT12 = 3.4641016151377545870548926830117447339f; // 2*SQRT3
+
+// the reconstruction in LCh of Bayer raws, as process_lch_bayer() in
+// src/iop/hlreconstruct/lch.c: the last column and row only clip, where the
+// OpenCL kernel reconstructs from clamped reads
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_1f_lch_bayer(uint3 gid : SV_DispatchThreadID,
+                             uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                             uniform float clip, uniform int filters)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float pixel = in.readsingle(x, y);
+  if(x == width - 1 || y == height - 1)
+  {
+    out.write(int2(x, y), float4(min(clip, pixel)));
+    return;
+  }
+
+  bool clipped = false;
+  float R = 0.0f;
+  float Gmin = HL_FLT_MAX;
+  float Gmax = -HL_FLT_MAX;
+  float B = 0.0f;
+
+  // sample 1 bayer block, thus with 2 green values
+  for(int jj = 0; jj <= 1; jj++)
+    for(int ii = 0; ii <= 1; ii++)
+    {
+      const float val = in.readsingle(x + ii, y + jj);
+      clipped = clipped || val > clip;
+      const int c = FC(y + jj, x + ii, uint(filters));
+      if(c == 0) R = val;
+      else if(c == 1)
+      {
+        Gmin = min(Gmin, val);
+        Gmax = max(Gmax, val);
+      }
+      else B = val;
+    }
+
+  if(clipped)
+  {
+    const float Ro = min(R, clip);
+    const float Go = min(Gmin, clip);
+    const float Bo = min(B, clip);
+
+    const float L = (R + Gmax + B) / 3.0f;
+    float C = HL_SQRT3 * (R - Gmax);
+    float H = 2.0f * B - Gmax - R;
+
+    const float Co = HL_SQRT3 * (Ro - Go);
+    const float Ho = 2.0f * Bo - Go - Ro;
+
+    if(R != Gmax && Gmax != B)
+    {
+      const float ratio = sqrt((Co * Co + Ho * Ho) / (C * C + H * H));
+      C *= ratio;
+      H *= ratio;
+    }
+
+    const float RGB[3] = { L - H / 6.0f + C / HL_SQRT12, L - H / 6.0f - C / HL_SQRT12, L + H / 3.0f };
+    pixel = RGB[FC(y, x, uint(filters))];
+  }
+  out.write(int2(x, y), float4(pixel));
+}
+
+// the reconstruction in LCh of X-Trans raws, as highlights_1f_lch_xtrans in
+// ../basic.cl without its local buffer
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void highlights_1f_lch_xtrans(uint3 gid : SV_DispatchThreadID,
+                              uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                              uniform float clip, uniform StructuredBuffer<uint> xtrans)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float pixel = in.readsingle(x, y);
+
+  if(x < 2 || x > width - 3 || y < 2 || y > height - 3)
+  {
+    // fast path for border
+    out.write(int2(x, y), float4(min(clip, pixel)));
+    return;
+  }
+
+  // if current pixel is clipped, always reconstruct
+  bool clipped = pixel > clip;
+  if(!clipped)
+  {
+    // check if there is any 3x3 block touching the current pixel which has
+    // no clipping, as then we don't need to reconstruct the current pixel.
+    // This avoids zippering in edge transitions from clipped to unclipped
+    // areas, which X-Trans is prone to.
+    clipped = true;
+    for(int offset_j = -2; offset_j <= 0 && clipped; offset_j++)
+      for(int offset_i = -2; offset_i <= 0 && clipped; offset_i++)
+      {
+        clipped = false;
+        for(int jj = offset_j; jj <= offset_j + 2; jj++)
+          for(int ii = offset_i; ii <= offset_i + 2; ii++)
+            clipped = clipped || in.readsingle(x + ii, y + jj) > clip;
+      }
+  }
+
+  if(clipped)
+  {
+    float mean[3] = { 0.0f, 0.0f, 0.0f };
+    int cnt[3] = { 0, 0, 0 };
+    float RGBmax[3] = { -HL_FLT_MAX, -HL_FLT_MAX, -HL_FLT_MAX };
+
+    for(int jj = -1; jj <= 1; jj++)
+      for(int ii = -1; ii <= 1; ii++)
+      {
+        const float val = in.readsingle(x + ii, y + jj);
+        const int c = FCxtrans(y + jj, x + ii, xtrans);
+        mean[c] += val;
+        cnt[c]++;
+        RGBmax[c] = max(RGBmax[c], val);
+      }
+
+    const float Ro = min(mean[0] / cnt[0], clip);
+    const float Go = min(mean[1] / cnt[1], clip);
+    const float Bo = min(mean[2] / cnt[2], clip);
+
+    const float R = RGBmax[0];
+    const float G = RGBmax[1];
+    const float B = RGBmax[2];
+
+    const float L = (R + G + B) / 3.0f;
+    float C = HL_SQRT3 * (R - G);
+    float H = 2.0f * B - G - R;
+
+    const float Co = HL_SQRT3 * (Ro - Go);
+    const float Ho = 2.0f * Bo - Go - Ro;
+
+    if(R != G && G != B)
+    {
+      const float ratio = sqrt((Co * Co + Ho * Ho) / (C * C + H * H));
+      C *= ratio;
+      H *= ratio;
+    }
+
+    const float RGB[3] = { L - H / 6.0f + C / HL_SQRT12, L - H / 6.0f - C / HL_SQRT12, L + H / 3.0f };
+    pixel = RGB[FCxtrans(y, x, xtrans)];
+  }
+  out.write(int2(x, y), float4(pixel));
+}
+
 // the masks of the opposed method are byte arrays, as in OpenCL, packed four
 // to a word. Threads share words, so the masks start zeroed and bits are or-ed in.
 int _mask_get(RWStructuredBuffer<uint> mask, int i)
@@ -973,6 +1145,101 @@ float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth
       weight += w;
     }
   return sum / weight;
+}
+
+// clip_rotate_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl in
+// one kernel: kwidth 0 is bilinear, otherwise lanczos selects the filter, 0
+// for bicubic. Sampling follows the CPU process() of src/iop/clipping.c,
+// which keeps pixels up to one outside the input, as _lens_bilinear does.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void clip_rotate(uint3 gid : SV_DispatchThreadID,
+                 uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                 uniform int in_width, uniform int in_height,
+                 uniform int2 roi_in, uniform float2 roi_out, uniform float scale_in, uniform float scale_out,
+                 uniform int flip, uniform float2 t, uniform float2 k, uniform float4 mat,
+                 uniform float4 k_space, uniform float2 ka, uniform float4 ma, uniform float2 mb,
+                 uniform int kwidth, uniform int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float2 pi = roi_out + float2(x, y) + 0.5f;
+  pi -= (flip != 0 ? t.yx : t) * scale_out;
+  pi /= scale_out;
+
+  // backtransform() of ../basic.cl
+  pi.y /= 1.0f + pi.x * k.x;
+  pi.x /= 1.0f + pi.y * k.y;
+  float2 po = float2(pi.x * mat.x + pi.y * mat.y, pi.x * mat.z + pi.y * mat.w);
+
+  po = po * scale_in + t * scale_in;
+
+  if(k_space.z > 0.0f)
+  {
+    const float xx = po.x - k_space.x;
+    const float yy = po.y - k_space.y;
+    const float div = (ma.z * xx - ma.x * yy) * mb.y + (ma.y * yy - ma.w * xx) * mb.x + ma.x * ma.w - ma.y * ma.z;
+    po.x = (ma.w * xx - ma.y * yy) / div + ka.x;
+    po.y = -(ma.z * xx - ma.x * yy) / div + ka.y;
+  }
+
+  po -= float2(roi_in) + 0.5f;
+
+  float4 pixel = float4(0.0f);
+  if(kwidth == 0)
+    pixel = _lens_bilinear(in, po.x, po.y, in_width, in_height);
+  else
+  {
+    const int tx = int(floor(po.x));
+    const int ty = int(floor(po.y));
+    if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
+      pixel = _lens_filter(in, po.x, po.y, kwidth, lanczos, false, in_width, in_height);
+  }
+  out.write(int2(x, y), pixel);
+}
+
+// the copy and the warp of liquify in one, as process() of src/iop/liquify.c
+// does them: pixels of the map extent that the map moves are sampled at
+// their warped position, the rest copied. kwidth and lanczos are those of
+// clip_rotate.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void liquify_warp(uint3 gid : SV_DispatchThreadID,
+                  uniform ImageIn in, uniform ImageOut out, uniform int width, uniform int height,
+                  uniform int in_width, uniform int in_height, uniform int2 roi_in, uniform int2 roi_out,
+                  uniform StructuredBuffer<float2> map, uniform int4 extent,
+                  uniform int kwidth, uniform int lanczos)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int2 pos = roi_out + int2(x, y);
+  const int2 mp = pos - extent.xy;
+  const float2 warp = (mp.x >= 0 && mp.y >= 0 && mp.x < extent.z && mp.y < extent.w)
+    ? map[mp.y * extent.z + mp.x] : float2(0.0f);
+
+  const int2 ipos = pos - roi_in;
+  float4 pixel;
+  if(warp.x == 0.0f && warp.y == 0.0f)
+    pixel = in.Areadpixel(ipos.x, ipos.y);
+  else
+  {
+    const float2 p = float2(ipos) + warp;
+    pixel = float4(0.0f);
+    if(kwidth == 0)
+      pixel = _lens_bilinear(in, p.x, p.y, in_width, in_height);
+    else
+    {
+      const int tx = int(floor(p.x));
+      const int ty = int(floor(p.y));
+      if(tx >= -1 && ty >= -1 && tx < in_width && ty < in_height)
+        pixel = _lens_filter(in, p.x, p.y, kwidth, lanczos, false, in_width, in_height);
+    }
+  }
+  out.write(int2(x, y), pixel);
 }
 
 // lens_distort_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl:
