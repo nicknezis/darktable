@@ -43,7 +43,11 @@ static inline void weight(const dt_aligned_pixel_t c1,
   dt_aligned_pixel_t sharpened;
   for_each_channel(c)
     sharpened[c] = sharpen[c] * added[c];			// { -s*d1,  -s*(d2+d3), -s*(d2+d3), 0 }
-  dt_vector_exp(sharpened, weight);				// { wl, wc, wc, 1 }
+  // not dt_vector_exp(): it is off by more than 10% below -1, and the
+  // OpenCL kernel uses the real exp(). exp(x) = 2^(x / ln(2))
+  for_each_channel(c)
+    sharpened[c] *= 1.44269504f;
+  dt_vector_exp2(sharpened, weight);				// { wl, wc, wc, 1 }
 }
 
 static inline void accumulate(dt_aligned_pixel_t accum,
@@ -81,8 +85,8 @@ static inline void accumulate(dt_aligned_pixel_t accum,
 #define SUM_PIXEL_CONTRIBUTION						\
   do                                                                    \
   {                                                                     \
-    dt_aligned_pixel_t wp;                                              \
-    weight(px + 4*i, px2, vsharpen, wp);                                \
+    dt_aligned_pixel_t wp = { 1.0f, 1.0f, 1.0f, 1.0f };                 \
+    if(!flat) weight(px + 4*i, px2, vsharpen, wp);                      \
     dt_aligned_pixel_t w;                                               \
     const float f = filter[filter_idx++];                               \
     for_four_channels(c,aligned(px2))                                   \
@@ -129,6 +133,9 @@ void eaw_decompose_and_synthesize(float *const restrict out,
     };
   const int boundary = 2 * mult;
   const dt_aligned_pixel_t vsharpen = { -0.5f * sharpen, -sharpen, -sharpen, 0.0f };
+  // without edge sharpness every weight is exp(0) = 1, which
+  // dt_vector_exp2() only approximates, so skip computing it
+  const gboolean flat = sharpen == 0.0f;
 
   DT_OMP_FOR()
   for(size_t rowid = 0; rowid < height; rowid++)
