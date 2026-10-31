@@ -19,6 +19,19 @@
 #include "color_conversion.h"
 #include "rgb_norms.h"
 
+// the curve up to its last node and its extrapolation beyond, as process()
+// in src/iop/rgbcurve.c. lookup_unbounded() switches at 1, but the last
+// node can be left of it.
+static inline float lookup_curve(read_only image2d_t lut, const float x, constant const float *const a)
+{
+  if(x < 1.0f / a[0])
+  {
+    const int xi = clamp((int)(x * 0x10000ul), 0, 0xffff);
+    return read_imagef(lut, sampleri, (int2)(xi & 0xff, xi >> 8)).x;
+  }
+  return a[1] * dtcl_pow(x * a[0], a[2]);
+}
+
 kernel void
 rgbcurve(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
            read_only image2d_t table_r, read_only image2d_t table_g, read_only image2d_t table_b,
@@ -36,17 +49,17 @@ rgbcurve(read_only image2d_t in, write_only image2d_t out, const int width, cons
 
   if(autoscale == 1) // DT_S_SCALE_MANUAL_RGB
   {
-    pixel.x = lookup_unbounded(table_r, pixel.x, coeffs_r);
-    pixel.y = lookup_unbounded(table_g, pixel.y, coeffs_g);
-    pixel.z = lookup_unbounded(table_b, pixel.z, coeffs_b);
+    pixel.x = lookup_curve(table_r, pixel.x, coeffs_r);
+    pixel.y = lookup_curve(table_g, pixel.y, coeffs_g);
+    pixel.z = lookup_curve(table_b, pixel.z, coeffs_b);
   }
   else if(autoscale == 0) // DT_S_SCALE_AUTOMATIC_RGB
   {
     if (preserve_colors == DT_RGB_NORM_NONE)
     {
-      pixel.x = lookup_unbounded(table_r, pixel.x, coeffs_r);
-      pixel.y = lookup_unbounded(table_r, pixel.y, coeffs_r);
-      pixel.z = lookup_unbounded(table_r, pixel.z, coeffs_r);
+      pixel.x = lookup_curve(table_r, pixel.x, coeffs_r);
+      pixel.y = lookup_curve(table_r, pixel.y, coeffs_r);
+      pixel.z = lookup_curve(table_r, pixel.z, coeffs_r);
     }
     else
     {
@@ -54,7 +67,7 @@ rgbcurve(read_only image2d_t in, write_only image2d_t out, const int width, cons
       const float lum = dt_rgb_norm(pixel, preserve_colors, use_work_profile, profile_info, lut);
       if(lum > 0.f)
       {
-        const float curve_lum = lookup_unbounded(table_r, lum, coeffs_r);
+        const float curve_lum = lookup_curve(table_r, lum, coeffs_r);
         ratio = curve_lum / lum;
       }
       pixel.xyz *= ratio;
