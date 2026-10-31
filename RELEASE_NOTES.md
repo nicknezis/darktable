@@ -812,6 +812,10 @@ changes (where available).
   the chromaticity, hue, color or HSV blend modes in display RGB, where
   OpenCL gave the right color.
 
+- Fixed floating-point raw files with embedded DNG gain maps coming out
+  wrong with OpenCL. The gain maps of other raw files are now also
+  applied the same way with OpenCL as on the CPU.
+
 ## Lua
 
 ### API Version
