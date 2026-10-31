@@ -808,6 +808,10 @@ changes (where available).
   the chromaticity, hue, color or HSV blend modes in display RGB, where
   OpenCL gave the right color.
 
+- Fixed the tone curve giving brighter or darker tones with OpenCL than
+  on the CPU above the L curve's last node, when that node is left of
+  the right edge.
+
 ## Lua
 
 ### API Version
