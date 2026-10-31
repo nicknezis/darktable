@@ -1470,6 +1470,19 @@ colorin_clipping (read_only image2d_t in, write_only image2d_t out, const int wi
   write_imagef(out, (int2)(x, y), pixel);
 }
 
+// the L curve up to its last node and its extrapolation beyond, as process()
+// in src/iop/tonecurve.c. lookup_unbounded() switches at 1, but the last
+// node can be left of it.
+static inline float tonecurve_lookup_L(read_only image2d_t lut, const float x, constant const float *const a)
+{
+  if(x < 1.0f / a[0])
+  {
+    const int xi = clamp((int)(x * 0x10000ul), 0, 0xffff);
+    return read_imagef(lut, sampleri, (int2)(xi & 0xff, xi >> 8)).x;
+  }
+  return a[1] * dtcl_pow(x * a[0], a[2]);
+}
+
 /* kernel for the tonecurve plugin. */
 kernel void
 tonecurve (read_only image2d_t in, write_only image2d_t out, const int width, const int height,
@@ -1486,7 +1499,7 @@ tonecurve (read_only image2d_t in, write_only image2d_t out, const int width, co
   float4 pixel = readpixel(in, x, y);
   const float L_in = pixel.x/100.0f;
   // use lut or extrapolation:
-  const float L = lookup_unbounded(table_L, L_in, coeffs_L);
+  const float L = tonecurve_lookup_L(table_L, L_in, coeffs_L);
 
   if (autoscale_ab == 0)
   {
@@ -1523,9 +1536,9 @@ tonecurve (read_only image2d_t in, write_only image2d_t out, const int width, co
   else if(autoscale_ab == 2)
   {
     float4 xyz = Lab_to_XYZ(pixel);
-    xyz.x = lookup_unbounded(table_L, xyz.x, coeffs_L);
-    xyz.y = lookup_unbounded(table_L, xyz.y, coeffs_L);
-    xyz.z = lookup_unbounded(table_L, xyz.z, coeffs_L);
+    xyz.x = tonecurve_lookup_L(table_L, xyz.x, coeffs_L);
+    xyz.y = tonecurve_lookup_L(table_L, xyz.y, coeffs_L);
+    xyz.z = tonecurve_lookup_L(table_L, xyz.z, coeffs_L);
     pixel.xyz = XYZ_to_Lab(xyz).xyz;
   }
   else if(autoscale_ab == 3)
@@ -1534,9 +1547,9 @@ tonecurve (read_only image2d_t in, write_only image2d_t out, const int width, co
 
     if (preserve_colors == DT_RGB_NORM_NONE)
     {
-      rgb.x = lookup_unbounded(table_L, rgb.x, coeffs_L);
-      rgb.y = lookup_unbounded(table_L, rgb.y, coeffs_L);
-      rgb.z = lookup_unbounded(table_L, rgb.z, coeffs_L);
+      rgb.x = tonecurve_lookup_L(table_L, rgb.x, coeffs_L);
+      rgb.y = tonecurve_lookup_L(table_L, rgb.y, coeffs_L);
+      rgb.z = tonecurve_lookup_L(table_L, rgb.z, coeffs_L);
     }
     else
     {
@@ -1544,7 +1557,7 @@ tonecurve (read_only image2d_t in, write_only image2d_t out, const int width, co
       float lum = dt_rgb_norm(rgb, preserve_colors, 1, profile_info, lut);
       if(lum > 0.f)
       {
-        const float curve_lum = lookup_unbounded(table_L, lum, coeffs_L);
+        const float curve_lum = tonecurve_lookup_L(table_L, lum, coeffs_L);
         ratio = curve_lum / lum;
       }
       rgb.xyz *= ratio;
