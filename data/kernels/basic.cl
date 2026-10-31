@@ -133,7 +133,7 @@ rawprepare_1f_unnormalized_gainmap(read_only image2d_t in, write_only image2d_t 
 
   if(x >= width  || y >= height) return;
 
-  const float pix = read_imageui(in, sampleri, (int2)(x + cx, y + cy)).x;
+  const float pix = read_imagef(in, sampleri, (int2)(x + cx, y + cy)).x;
   const int id = BL(ry+cy+y, rx+cx+x);
   const float n = pix - sub[id];
   const float q = n * rdiv[id];
