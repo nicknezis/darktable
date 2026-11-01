@@ -21,10 +21,6 @@
 
 import common;
 
-// MIN_FLOAT of src/common/luminance_mask.h and NORM_MIN of src/common/math.h
-static const float CT_MIN_FLOAT = 1.52587890625e-05f;
-static const float CT_NORM_MIN = 1.52587890625e-05f;
-
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void contrastntexture_luminance(uint3 gid : SV_DispatchThreadID,
@@ -38,7 +34,7 @@ void contrastntexture_luminance(uint3 gid : SV_DispatchThreadID,
 
   const float4 pixel = in.Areadpixel(x, y);
   const float norm = max(dtcl_sqrt(pixel.x * pixel.x + pixel.y * pixel.y + pixel.z * pixel.z),
-                         CT_MIN_FLOAT);
+                         NORM_MIN);
   const int k = y * width + x;
   const float lum = (1.0f / sqrt(3.0f)) * norm + noise_bias;
   luminance[k] = lum;
@@ -63,11 +59,11 @@ void contrastntexture_details(uint3 gid : SV_DispatchThreadID,
   const float pixel = highpass[k];
   const float smoothed = lowpass[k];
 
-  const float log_pixel = dtcl_log2(max(pixel, CT_NORM_MIN));
-  const float log_smoothed = dtcl_log2(max(smoothed, CT_NORM_MIN));
+  const float log_pixel = dtcl_log2(max(pixel, NORM_MIN));
+  const float log_smoothed = dtcl_log2(max(smoothed, NORM_MIN));
   const float noise_power = noise_bias * noise_bias;
   const float combined_power = smoothed * smoothed;
-  const float weiner_gain = max(combined_power - noise_power, 0.0f) / max(combined_power, CT_NORM_MIN);
+  const float weiner_gain = max(combined_power - noise_power, 0.0f) / max(combined_power, NORM_MIN);
   const float detail = gain * (weiner_gain * clamp(log_pixel - log_smoothed, -5.0f, 5.0f));
   corrections[k] = accumulate != 0 ? corrections[k] + detail : detail;
 
@@ -79,7 +75,7 @@ void contrastntexture_details(uint3 gid : SV_DispatchThreadID,
 float _shadows_highlights(float luminance_lowpass, float slope_shadows, float slope_highlights,
                           float midtones_width, float4 polynomial, float pivot_offset)
 {
-  const float normalized_ev = dtcl_log2(max(luminance_lowpass, CT_NORM_MIN)) - pivot_offset;
+  const float normalized_ev = dtcl_log2(max(luminance_lowpass, NORM_MIN)) - pivot_offset;
   float correction_ev;
   if(normalized_ev <= -midtones_width)
     correction_ev = slope_shadows * normalized_ev;
