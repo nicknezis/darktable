@@ -248,6 +248,9 @@ changes (where available).
 - Highlight reconstruction's inpaint opposed method now runs on OpenCL
   for linear raws, such as sRAW and linear DNG files.
 
+- Enlarge canvas now runs on OpenCL, so it no longer moves the image
+  back to the CPU in the middle of an otherwise GPU pipeline.
+
 - Hovering over and dragging nodes of long drawn brush strokes and
   paths is much faster, as the mask overlay is no longer redrawn on
   every mouse move and long outlines are drawn with far fewer points.
