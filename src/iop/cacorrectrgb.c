@@ -24,8 +24,12 @@
 #include "gui/color_picker_proxy.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
+#include "common/bilinear.h"
 #include "common/gaussian.h"
 #include "common/fast_guided_filter.h"
+#include "common/opencl.h"
+#include "common/slang_gpu.h"
+#include "develop/tiling.h"
 
 #include <gtk/gtk.h>
 #include <stdlib.h>
@@ -154,6 +158,16 @@ typedef struct dt_iop_cacorrectrgb_gui_data_t
 {
   GtkWidget *guide_channel, *radius, *strength, *mode, *refine_manifolds;
 } dt_iop_cacorrectrgb_gui_data_t;
+
+typedef struct dt_iop_cacorrectrgb_global_data_t
+{
+  int kernel_manifolds;
+  int kernel_normalize;
+  int kernel_refine;
+  int kernel_apply;
+  int kernel_artifacts_prepare;
+  int kernel_artifacts;
+} dt_iop_cacorrectrgb_global_data_t;
 
 const char *name()
 {
@@ -678,6 +692,292 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   // keep algorithm result even if it overshoots
   const float safety = powf(20.0f, 1.0f - d->strength);
   reduce_chromatic_aberrations(in, width, height, ch, sigma, sigma2, d->guide_channel, d->mode, d->refine_manifolds, safety, out);
+}
+
+void tiling_callback(dt_iop_module_t *self,
+                     dt_dev_pixelpipe_iop_t *piece,
+                     const dt_iop_roi_t *roi_in,
+                     const dt_iop_roi_t *roi_out,
+                     dt_develop_tiling_t *tiling)
+{
+  const dt_iop_cacorrectrgb_params_t *d = piece->data;
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma = fmaxf(d->radius / scale, 1.0f);
+  const float downsize = fminf(3.0f, sigma);
+  const float ds = 1.0f / (downsize * downsize);
+
+  // CPU: in + out + upscaled manifolds (6 floats) + one 4-channel buffer
+  // in reduce_artifacts(), and the blurs of the downscaled image.
+  // OpenCL: in + out + corrected + two upscaled manifolds + the gaussian's
+  // two buffers, and six downscaled images with their gaussian buffers
+  tiling->factor = 2.0f + 1.5f + 2.0f + 6.0f * ds;
+  tiling->factor_cl = 7.0f + 8.0f * ds;
+  tiling->maxbuf = 1.0f;
+  tiling->overhead = 0;
+  tiling->overlap = 0;
+  tiling->align = 1;
+}
+
+#ifdef HAVE_OPENCL
+int process_cl(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               cl_mem dev_in,
+               cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrectrgb_params_t *d = piece->data;
+  const dt_iop_cacorrectrgb_global_data_t *gd = self->global_data;
+  if(piece->colors != 4) return DT_OPENCL_PROCESS_CL;
+
+  const int devid = piece->pipe->devid;
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  // as process() and reduce_chromatic_aberrations()
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma = fmaxf(d->radius / scale, 1.0f);
+  const float sigma2 = fmaxf(d->radius * d->radius / scale, 1.0f);
+  const float safety = powf(20.0f, 1.0f - d->strength);
+  const int guide = d->guide_channel;
+  const int mode = d->mode;
+
+  const float downsize = fminf(3.0f, sigma);
+  const int ds_width = width / downsize;
+  const int ds_height = height / downsize;
+  if(ds_width < 1 || ds_height < 1) return DT_OPENCL_PROCESS_CL;
+
+  const float ds_sigma = sigma / downsize;
+  const float ds_sigma2 = sigma2 / downsize;
+  const dt_aligned_pixel_t max = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t min = { -FLT_MAX, -FLT_MAX, -FLT_MAX, 0.0f };
+  const dt_aligned_pixel_t min_artifacts = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  cl_int err = DT_OPENCL_DEFAULT_ERROR;
+  dt_gaussian_cl_t *g = NULL;
+
+  const size_t bpp = sizeof(float) * 4;
+  cl_mem ds_in = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem ds_blurred = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem ds_high = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem ds_low = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem ds_high2 = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem ds_low2 = dt_opencl_alloc_device(devid, ds_width, ds_height, bpp);
+  cl_mem corrected = dt_opencl_alloc_device(devid, width, height, bpp);
+  cl_mem high = dt_opencl_alloc_device(devid, width, height, bpp);
+  cl_mem low = dt_opencl_alloc_device(devid, width, height, bpp);
+  if(!ds_in || !ds_blurred || !ds_high || !ds_low || !ds_high2 || !ds_low2
+     || !corrected || !high || !low)
+    goto error;
+
+  err = dt_interpolate_bilinear_image_cl(devid, dev_in, width, height, ds_in, ds_width, ds_height);
+  if(err != CL_SUCCESS) goto error;
+
+  // get_manifolds(): the first estimate takes the larger blur when it gets refined
+  g = dt_gaussian_init_cl(devid, ds_width, ds_height, 4, max, min,
+                          d->refine_manifolds ? ds_sigma2 : ds_sigma, 0);
+  if(!g) { err = DT_OPENCL_PROCESS_CL; goto error; }
+  err = dt_gaussian_blur_cl(g, ds_in, ds_blurred);
+  if(err != CL_SUCCESS) goto error;
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_manifolds, ds_width, ds_height,
+          CLARG(ds_in), CLARG(ds_blurred), CLARG(ds_high), CLARG(ds_low),
+          CLARG(ds_width), CLARG(ds_height), CLARG(guide));
+  if(err != CL_SUCCESS) goto error;
+  err = dt_gaussian_blur_cl(g, ds_high, ds_high);
+  if(err != CL_SUCCESS) goto error;
+  err = dt_gaussian_blur_cl(g, ds_low, ds_low);
+  if(err != CL_SUCCESS) goto error;
+  dt_gaussian_free_cl(g);
+  g = NULL;
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_normalize, ds_width, ds_height,
+          CLARG(ds_blurred), CLARG(ds_high), CLARG(ds_low), CLARG(ds_high2), CLARG(ds_low2),
+          CLARG(ds_width), CLARG(ds_height), CLARG(guide));
+  if(err != CL_SUCCESS) goto error;
+
+  // the manifolds are now in ds_high2 and ds_low2
+  if(d->refine_manifolds)
+  {
+    g = dt_gaussian_init_cl(devid, ds_width, ds_height, 4, max, min, ds_sigma, 0);
+    if(!g) { err = DT_OPENCL_PROCESS_CL; goto error; }
+    err = dt_gaussian_blur_cl(g, ds_in, ds_blurred);
+    if(err != CL_SUCCESS) goto error;
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_refine, ds_width, ds_height,
+            CLARG(ds_in), CLARG(ds_high2), CLARG(ds_low2), CLARG(ds_blurred),
+            CLARG(ds_high), CLARG(ds_low), CLARG(ds_width), CLARG(ds_height), CLARG(guide));
+    if(err != CL_SUCCESS) goto error;
+    err = dt_gaussian_blur_cl(g, ds_high, ds_high);
+    if(err != CL_SUCCESS) goto error;
+    err = dt_gaussian_blur_cl(g, ds_low, ds_low);
+    if(err != CL_SUCCESS) goto error;
+    dt_gaussian_free_cl(g);
+    g = NULL;
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_normalize, ds_width, ds_height,
+            CLARG(ds_blurred), CLARG(ds_high), CLARG(ds_low), CLARG(ds_high2), CLARG(ds_low2),
+            CLARG(ds_width), CLARG(ds_height), CLARG(guide));
+    if(err != CL_SUCCESS) goto error;
+  }
+
+  err = dt_interpolate_bilinear_image_cl(devid, ds_high2, ds_width, ds_height, high, width, height);
+  if(err != CL_SUCCESS) goto error;
+  err = dt_interpolate_bilinear_image_cl(devid, ds_low2, ds_width, ds_height, low, width, height);
+  if(err != CL_SUCCESS) goto error;
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_apply, width, height,
+          CLARG(dev_in), CLARG(high), CLARG(low), CLARG(corrected),
+          CLARG(width), CLARG(height), CLARG(guide), CLARG(mode));
+  if(err != CL_SUCCESS) goto error;
+
+  // reduce_artifacts(), with the upscaled manifolds' memory reused
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_artifacts_prepare, width, height,
+          CLARG(dev_in), CLARG(corrected), CLARG(high), CLARG(width), CLARG(height), CLARG(guide));
+  if(err != CL_SUCCESS) goto error;
+  g = dt_gaussian_init_cl(devid, width, height, 4, max, min_artifacts, sigma, 0);
+  if(!g) { err = DT_OPENCL_PROCESS_CL; goto error; }
+  err = dt_gaussian_blur_cl(g, high, high);
+  if(err != CL_SUCCESS) goto error;
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_artifacts, width, height,
+          CLARG(dev_in), CLARG(corrected), CLARG(high), CLARG(dev_out),
+          CLARG(width), CLARG(height), CLARG(guide), CLARG(safety));
+
+error:
+  if(g) dt_gaussian_free_cl(g);
+  dt_opencl_release_mem_object(ds_in);
+  dt_opencl_release_mem_object(ds_blurred);
+  dt_opencl_release_mem_object(ds_high);
+  dt_opencl_release_mem_object(ds_low);
+  dt_opencl_release_mem_object(ds_high2);
+  dt_opencl_release_mem_object(ds_low2);
+  dt_opencl_release_mem_object(corrected);
+  dt_opencl_release_mem_object(high);
+  dt_opencl_release_mem_object(low);
+  return err;
+}
+#endif
+
+#ifdef HAVE_SLANG_GPU
+gboolean process_slang(dt_iop_module_t *self,
+                       dt_dev_pixelpipe_iop_t *piece,
+                       dt_slang_gpu_image_t *dev_in,
+                       dt_slang_gpu_image_t *dev_out,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrectrgb_params_t *d = piece->data;
+  if(piece->colors != 4) return FALSE;
+
+  const int width = roi_out->width;
+  const int height = roi_out->height;
+
+  // as process_cl()
+  const float scale = fmaxf(piece->iscale / roi_in->scale, 1.f);
+  const float sigma = fmaxf(d->radius / scale, 1.0f);
+  const float sigma2 = fmaxf(d->radius * d->radius / scale, 1.0f);
+  const float safety = powf(20.0f, 1.0f - d->strength);
+  const int guide = d->guide_channel;
+  const int mode = d->mode;
+
+  const float downsize = fminf(3.0f, sigma);
+  const int ds_width = width / downsize;
+  const int ds_height = height / downsize;
+  if(ds_width < 1 || ds_height < 1) return FALSE;
+
+  const float ds_sigma = sigma / downsize;
+  const float ds_sigma2 = sigma2 / downsize;
+  const dt_aligned_pixel_t max = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t min = { -FLT_MAX, -FLT_MAX, -FLT_MAX, 0.0f };
+  const dt_aligned_pixel_t min_artifacts = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  dt_slang_gpu_image_t *ds_in = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_blurred = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_high = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_low = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_high2 = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *ds_low2 = dt_slang_gpu_image_new(ds_width, ds_height, 4, NULL);
+  dt_slang_gpu_image_t *corrected = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *high = dt_slang_gpu_image_new(width, height, 4, NULL);
+  dt_slang_gpu_image_t *low = dt_slang_gpu_image_new(width, height, 4, NULL);
+
+  int err = !ds_in || !ds_blurred || !ds_high || !ds_low || !ds_high2 || !ds_low2
+    || !corrected || !high || !low
+    || dt_interpolate_bilinear_image_slang(dev_in, width, height, ds_in, ds_width, ds_height)
+    || dt_gaussian_blur_4c_slang(ds_in, ds_blurred, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_manifolds", ds_width, ds_height,
+         SLIMG_DEV(ds_in), SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low),
+         SLARG(ds_width), SLARG(ds_height), SLARG(guide))
+    || dt_gaussian_blur_4c_slang(ds_high, ds_high, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_gaussian_blur_4c_slang(ds_low, ds_low, ds_width, ds_height,
+                                 d->refine_manifolds ? ds_sigma2 : ds_sigma, DT_IOP_GAUSSIAN_ZERO, max, min)
+    || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_normalize", ds_width, ds_height,
+         SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLIMG_DEV(ds_high2),
+         SLIMG_DEV(ds_low2), SLARG(ds_width), SLARG(ds_height), SLARG(guide));
+
+  if(!err && d->refine_manifolds)
+    err = dt_gaussian_blur_4c_slang(ds_in, ds_blurred, ds_width, ds_height, ds_sigma,
+                                    DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_refine", ds_width, ds_height,
+           SLIMG_DEV(ds_in), SLIMG_DEV(ds_high2), SLIMG_DEV(ds_low2), SLIMG_DEV(ds_blurred),
+           SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLARG(ds_width), SLARG(ds_height), SLARG(guide))
+      || dt_gaussian_blur_4c_slang(ds_high, ds_high, ds_width, ds_height, ds_sigma,
+                                   DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_gaussian_blur_4c_slang(ds_low, ds_low, ds_width, ds_height, ds_sigma,
+                                   DT_IOP_GAUSSIAN_ZERO, max, min)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_normalize", ds_width, ds_height,
+           SLIMG_DEV(ds_blurred), SLIMG_DEV(ds_high), SLIMG_DEV(ds_low), SLIMG_DEV(ds_high2),
+           SLIMG_DEV(ds_low2), SLARG(ds_width), SLARG(ds_height), SLARG(guide));
+
+  if(!err)
+    err = dt_interpolate_bilinear_image_slang(ds_high2, ds_width, ds_height, high, width, height)
+      || dt_interpolate_bilinear_image_slang(ds_low2, ds_width, ds_height, low, width, height)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_apply", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(high), SLIMG_DEV(low), SLIMG_DEV(corrected),
+           SLARG(width), SLARG(height), SLARG(guide), SLARG(mode))
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_artifacts_prepare", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(corrected), SLIMG_DEV(high),
+           SLARG(width), SLARG(height), SLARG(guide))
+      || dt_gaussian_blur_4c_slang(high, high, width, height, sigma, DT_IOP_GAUSSIAN_ZERO,
+                                   max, min_artifacts)
+      || dt_slang_gpu_run_2d_args("cacorrectrgb", "cacorrectrgb_artifacts", width, height,
+           SLIMG_DEV(dev_in), SLIMG_DEV(corrected), SLIMG_DEV(high), SLIMG_DEV(dev_out),
+           SLARG(width), SLARG(height), SLARG(guide), SLARG(safety));
+
+  dt_slang_gpu_image_free(ds_in);
+  dt_slang_gpu_image_free(ds_blurred);
+  dt_slang_gpu_image_free(ds_high);
+  dt_slang_gpu_image_free(ds_low);
+  dt_slang_gpu_image_free(ds_high2);
+  dt_slang_gpu_image_free(ds_low2);
+  dt_slang_gpu_image_free(corrected);
+  dt_slang_gpu_image_free(high);
+  dt_slang_gpu_image_free(low);
+  return !err;
+}
+#endif
+
+void init_global(dt_iop_module_so_t *self)
+{
+  const int program = 47; // cacorrectrgb.cl, from programs.conf
+  dt_iop_cacorrectrgb_global_data_t *gd = malloc(sizeof(dt_iop_cacorrectrgb_global_data_t));
+  self->data = gd;
+  gd->kernel_manifolds = dt_opencl_create_kernel(program, "cacorrectrgb_manifolds");
+  gd->kernel_normalize = dt_opencl_create_kernel(program, "cacorrectrgb_normalize");
+  gd->kernel_refine = dt_opencl_create_kernel(program, "cacorrectrgb_refine");
+  gd->kernel_apply = dt_opencl_create_kernel(program, "cacorrectrgb_apply");
+  gd->kernel_artifacts_prepare = dt_opencl_create_kernel(program, "cacorrectrgb_artifacts_prepare");
+  gd->kernel_artifacts = dt_opencl_create_kernel(program, "cacorrectrgb_artifacts");
+}
+
+void cleanup_global(dt_iop_module_so_t *self)
+{
+  dt_iop_cacorrectrgb_global_data_t *gd = self->data;
+  dt_opencl_free_kernel(gd->kernel_manifolds);
+  dt_opencl_free_kernel(gd->kernel_normalize);
+  dt_opencl_free_kernel(gd->kernel_refine);
+  dt_opencl_free_kernel(gd->kernel_apply);
+  dt_opencl_free_kernel(gd->kernel_artifacts_prepare);
+  dt_opencl_free_kernel(gd->kernel_artifacts);
+  free(self->data);
+  self->data = NULL;
 }
 
 void gui_update(dt_iop_module_t *self)
