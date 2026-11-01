@@ -18,11 +18,6 @@
 
 #include "common.h"
 
-// see compute_luminance() in src/iop/contrastntexture.c, MIN_FLOAT in
-// src/common/luminance_mask.h and NORM_MIN in src/common/math.h
-#define CT_MIN_FLOAT 0x1p-16f
-#define CT_NORM_MIN 1.52587890625e-05f
-
 // the luminance goes to both buffers: the blur of the first level works in
 // place on one, the band pass needs the other unblurred
 kernel void contrastntexture_luminance(read_only image2d_t in,
@@ -36,9 +31,9 @@ kernel void contrastntexture_luminance(read_only image2d_t in,
   const int y = get_global_id(1);
   if(x >= width || y >= height) return;
 
-  const float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  const float4 pixel = Areadpixel(in, x, y);
   const float norm = fmax(dtcl_sqrt(pixel.x * pixel.x + pixel.y * pixel.y + pixel.z * pixel.z),
-                          CT_MIN_FLOAT);
+                          NORM_MIN);
   const int k = mad24(y, width, x);
   const float lum = (1.0f / sqrt(3.0f)) * norm + noise_bias;
   luminance[k] = lum;
@@ -66,11 +61,11 @@ kernel void contrastntexture_details(global float *const highpass,
   const float pixel = highpass[k];
   const float smoothed = lowpass[k];
 
-  const float log_pixel = dtcl_log2(fmax(pixel, CT_NORM_MIN));
-  const float log_smoothed = dtcl_log2(fmax(smoothed, CT_NORM_MIN));
+  const float log_pixel = dtcl_log2(fmax(pixel, NORM_MIN));
+  const float log_smoothed = dtcl_log2(fmax(smoothed, NORM_MIN));
   const float noise_power = noise_bias * noise_bias;
   const float combined_power = smoothed * smoothed;
-  const float weiner_gain = fmax(combined_power - noise_power, 0.0f) / fmax(combined_power, CT_NORM_MIN);
+  const float weiner_gain = fmax(combined_power - noise_power, 0.0f) / fmax(combined_power, NORM_MIN);
   const float detail = gain * (weiner_gain * clamp(log_pixel - log_smoothed, -5.0f, 5.0f));
   corrections[k] = accumulate ? corrections[k] + detail : detail;
 
@@ -87,7 +82,7 @@ static inline float _shadows_highlights(const float luminance_lowpass,
                                         const float4 polynomial,
                                         const float pivot_offset)
 {
-  const float normalized_ev = dtcl_log2(fmax(luminance_lowpass, CT_NORM_MIN)) - pivot_offset;
+  const float normalized_ev = dtcl_log2(fmax(luminance_lowpass, NORM_MIN)) - pivot_offset;
   float correction_ev;
   if(normalized_ev <= -midtones_width)
     correction_ev = slope_shadows * normalized_ev;
@@ -118,7 +113,7 @@ kernel void contrastntexture_apply(read_only image2d_t in,
   if(x >= width || y >= height) return;
 
   const int k = mad24(y, width, x);
-  const float4 pixel = read_imagef(in, sampleri, (int2)(x, y));
+  const float4 pixel = Areadpixel(in, x, y);
   const float lowpass_correction = _shadows_highlights(lowpass[k], slope_shadows, slope_highlights,
                                                        midtones_width, polynomial, pivot_offset);
   const float multiplier = dtcl_exp2(corrections[k] + lowpass_correction);
