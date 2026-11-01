@@ -144,7 +144,7 @@ static void _process_linear_opposed(dt_iop_module_t *self,
           const size_t mdx = _raw_to_cmap(mwidth, mheight, row, col);
           for_three_channels(c)
           {
-            if((input[idx] >= clips[c]) && (mask[c*msize + mdx] == 0))
+            if((input[idx+c] >= clips[c]) && (mask[c*msize + mdx] == 0))
             {
               mask[c * msize + mdx] |= 1;
               anyclipped |= TRUE;
