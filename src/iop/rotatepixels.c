@@ -227,7 +227,7 @@ void modify_roi_out(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, dt_iop
   const float y = sqrtf(2.0f * T * T),
               x = sqrtf(2.0f * ((float)roi_in->width - T) * ((float)roi_in->width - T));
 
-  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
   const float IW = (float)interpolation->width * scale;
 
   roi_out->width = y - IW;
@@ -261,7 +261,7 @@ void modify_roi_in(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const d
     adjust_aabb(o, aabb_in);
   }
 
-  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
   const float IW = (float)interpolation->width * scale;
 
   const float orig_w = roi_in->scale * piece->buf_in.width, orig_h = roi_in->scale * piece->buf_in.height;
@@ -291,7 +291,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
 
   assert(ch == 4);
 
-  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
 
   DT_OMP_FOR()
   // (slow) point-by-point transformation.
@@ -330,7 +330,7 @@ int process_cl(dt_iop_module_t *self,
   const int devid = piece->pipe->devid;
 
   const float scale = roi_in->scale / piece->iscale;
-  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
 
   // backtransform() as one matrix and offset
   const float m[4] = { d->m[0], -d->m[1], -d->m[2], d->m[3] };
@@ -360,7 +360,7 @@ gboolean process_slang(dt_iop_module_t *self,
   const dt_iop_rotatepixels_data_t *d = piece->data;
 
   const float scale = roi_in->scale / piece->iscale;
-  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  const dt_interpolation_t *interpolation = dt_interpolation_new(DT_INTERPOLATION_USERPREF_WARP);
 
   // as process_cl()
   const float m[4] = { d->m[0], -d->m[1], -d->m[2], d->m[3] };
