@@ -62,6 +62,37 @@ static inline gboolean _gui_fullpipe(dt_dev_pixelpipe_iop_t *piece)
      && darktable.develop->late_scaling.enabled;
 }
 
+static float _tiling_factor(const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const float ioratio
+      = (float)(roi_out->width * roi_out->height) / (float)(roi_in->width * roi_in->height);
+
+  // approximate extra requirements for interpolation
+  return 1.0f + ioratio + (ioratio != 1.0f ? 0.5f : 0.0f);
+}
+
+#ifdef HAVE_OPENCL
+// a tiled upscale reads every output tile back to the host, which is no
+// faster than the CPU path, and slower over PCIe, so the device only
+// upscales what it holds untiled
+static gboolean _upscale_fits_device(const dt_dev_pixelpipe_iop_t *piece,
+                                     const dt_iop_roi_t *const roi_in,
+                                     const dt_iop_roi_t *const roi_out)
+{
+  const int devid = piece->pipe->devid;
+  if(!darktable.opencl->inited || devid < 0) return FALSE;
+
+  const dt_opencl_device_t *dev = &darktable.opencl->dev[devid];
+  if(roi_out->width > dev->max_image_width || roi_out->height > dev->max_image_height)
+    return FALSE;
+
+  const float needed = 4.0f * sizeof(float) * roi_in->width * roi_in->height
+                       * _tiling_factor(roi_in, roi_out);
+  return needed < (float)dt_opencl_get_device_available(devid);
+}
+#endif
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *const roi_out,
@@ -117,6 +148,12 @@ void modify_roi_in(dt_iop_module_t *self,
     roi_in->width = piece->buf_in.width;
     roi_in->height = piece->buf_in.height;
   }
+
+#ifdef HAVE_OPENCL
+  if(roi_out->scale > 1.0f && !piece->pipe->tiling
+     && !_upscale_fits_device(piece, roi_in, roi_out))
+    piece->process_cl_ready = FALSE;
+#endif
 }
 
 void tiling_callback(dt_iop_module_t *self,
@@ -125,11 +162,7 @@ void tiling_callback(dt_iop_module_t *self,
                      const dt_iop_roi_t *roi_out,
                      struct dt_develop_tiling_t *tiling)
 {
-  const float ioratio
-      = (float)(roi_out->width * roi_out->height) / (float)(roi_in->width * roi_in->height);
-
-  tiling->factor = 1.0f + ioratio;
-  tiling->factor += ioratio != 1.0f ? 0.5f : 0.0f; // approximate extra requirements for interpolation
+  tiling->factor = _tiling_factor(roi_in, roi_out);
   tiling->factor_cl = tiling->factor;
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = tiling->maxbuf;
