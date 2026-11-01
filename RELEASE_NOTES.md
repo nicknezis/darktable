@@ -242,6 +242,9 @@ changes (where available).
   faster processing times in comparison to CPU code path, depending on
   CPU & GPU.
 
+- Rotate pixels, which straightens the sensor layout of Fujifilm
+  SuperCCD raws, now runs on OpenCL.
+
 - Hovering over and dragging nodes of long drawn brush strokes and
   paths is much faster, as the mask overlay is no longer redrawn on
   every mouse move and long outlines are drawn with far fewer points.
