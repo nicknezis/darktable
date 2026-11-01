@@ -242,6 +242,9 @@ changes (where available).
   faster processing times in comparison to CPU code path, depending on
   CPU & GPU.
 
+- Exports that upscale the image now do the final upscale on OpenCL
+  instead of moving the image back to the CPU for the last step.
+
 - Hovering over and dragging nodes of long drawn brush strokes and
   paths is much faster, as the mask overlay is no longer redrawn on
   every mouse move and long outlines are drawn with far fewer points.
