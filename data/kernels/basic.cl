@@ -51,6 +51,22 @@ rawprepare_1f(read_only image2d_t in, write_only image2d_t out,
   write_imagef(out, (int2)(x, y), oval);
 }
 
+// the gain at map_pt, interpolated as in rawprepare's process(). The
+// linear sampler would do the same, but GPUs may compute its weights with
+// as little as 8 bits of precision, which shows in the image
+static float _gainmap_gain(read_only image2d_t map, const int2 map_size, const float2 map_pt)
+{
+  const float2 pt = clamp(map_pt, (float2)(0.0f, 0.0f), convert_float2(map_size));
+  const int2 i0 = min(convert_int2(pt), map_size - 1);
+  const int2 i1 = min(i0 + 1, map_size - 1);
+  const float2 frac = pt - convert_float2(i0);
+  const float top = (1.0f - frac.x) * read_imagef(map, sampleri, (int2)(i0.x, i0.y)).x
+                    + frac.x * read_imagef(map, sampleri, (int2)(i1.x, i0.y)).x;
+  const float bottom = (1.0f - frac.x) * read_imagef(map, sampleri, (int2)(i0.x, i1.y)).x
+                       + frac.x * read_imagef(map, sampleri, (int2)(i1.x, i1.y)).x;
+  return (1.0f - frac.y) * top + frac.y * bottom;
+}
+
 kernel void
 rawprepare_1f_gainmap(read_only image2d_t in, write_only image2d_t out,
               const int width, const int height,
@@ -74,21 +90,20 @@ rawprepare_1f_gainmap(read_only image2d_t in, write_only image2d_t out,
   const float rem = fma(-q, div[id], n);
   float pixel_scaled = fma(rem, rdiv[id], q);
 
-  // Add 0.5 to compensate for CLK_FILTER_LINEAR subtracting 0.5 from the specified coordinates
-  const float2 map_pt = ((float2)(rx+cx+x,ry+cy+y) * im_to_rel - map_origin) * rel_to_map + (float2)(0.5, 0.5);
+  const float2 map_pt = ((float2)(rx+cx+x,ry+cy+y) * im_to_rel - map_origin) * rel_to_map;
   switch(id)
   {
     case 0:
-      pixel_scaled *= read_imagef(map0, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map0, map_size, map_pt);
       break;
     case 1:
-      pixel_scaled *= read_imagef(map1, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map1, map_size, map_pt);
       break;
     case 2:
-      pixel_scaled *= read_imagef(map2, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map2, map_size, map_pt);
       break;
     case 3:
-      pixel_scaled *= read_imagef(map3, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map3, map_size, map_pt);
       break;
   }
 
@@ -133,28 +148,27 @@ rawprepare_1f_unnormalized_gainmap(read_only image2d_t in, write_only image2d_t 
 
   if(x >= width  || y >= height) return;
 
-  const float pix = read_imageui(in, sampleri, (int2)(x + cx, y + cy)).x;
+  const float pix = read_imagef(in, sampleri, (int2)(x + cx, y + cy)).x;
   const int id = BL(ry+cy+y, rx+cx+x);
   const float n = pix - sub[id];
   const float q = n * rdiv[id];
   const float rem = fma(-q, div[id], n);
   float pixel_scaled = fma(rem, rdiv[id], q);
 
-  // Add 0.5 to compensate for CLK_FILTER_LINEAR subtracting 0.5 from the specified coordinates
-  const float2 map_pt = ((float2)(rx+cx+x,ry+cy+y) * im_to_rel - map_origin) * rel_to_map + (float2)(0.5, 0.5);
+  const float2 map_pt = ((float2)(rx+cx+x,ry+cy+y) * im_to_rel - map_origin) * rel_to_map;
   switch(id)
   {
     case 0:
-      pixel_scaled *= read_imagef(map0, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map0, map_size, map_pt);
       break;
     case 1:
-      pixel_scaled *= read_imagef(map1, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map1, map_size, map_pt);
       break;
     case 2:
-      pixel_scaled *= read_imagef(map2, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map2, map_size, map_pt);
       break;
     case 3:
-      pixel_scaled *= read_imagef(map3, samplerf, map_pt).x;
+      pixel_scaled *= _gainmap_gain(map3, map_size, map_pt);
       break;
   }
 
