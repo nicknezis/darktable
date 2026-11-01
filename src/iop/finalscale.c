@@ -150,7 +150,11 @@ int process_cl(dt_iop_module_t *self,
   dt_print_pipe(DT_DEBUG_IMAGEIO,
                 exporting ? "clip_and_zoom_roi" : "clip_and_zoom",
                 piece->pipe, self, piece->pipe->devid, roi_in, roi_out, "device=%i", devid);
-  if(exporting)
+  // when tiling, the roi offsets place the tile in the export; shifts are
+  // ignored otherwise
+  if(exporting && piece->pipe->tiling)
+    return dt_iop_clip_and_zoom_tile_cl(devid, dev_out, dev_in, roi_out, roi_in);
+  else if(exporting)
     return dt_iop_clip_and_zoom_roi_cl(devid, dev_out, dev_in, roi_out, roi_in);
   else
     return dt_iop_clip_and_zoom_cl(devid, dev_out, dev_in, roi_out, roi_in);
@@ -185,7 +189,10 @@ void process(dt_iop_module_t *self,
                 exporting ? "clip_and_zoom_roi" : "clip_and_zoom",
                 piece->pipe, self, DT_DEVICE_CPU, roi_in, roi_out);
 
-  if(exporting)
+  // see process_cl()
+  if(exporting && piece->pipe->tiling)
+    dt_iop_clip_and_zoom_tile((float *)ovoid, (float *)ivoid, roi_out, roi_in);
+  else if(exporting)
     dt_iop_clip_and_zoom_roi((float *)ovoid, (float *)ivoid, roi_out, roi_in);
   else
     dt_iop_clip_and_zoom((float *)ovoid, (float *)ivoid, roi_out, roi_in, FALSE);
