@@ -812,6 +812,11 @@ changes (where available).
   the chromaticity, hue, color or HSV blend modes in display RGB, where
   OpenCL gave the right color.
 
+- Fixed rotate pixels, which straightens the sensor layout of Fujifilm
+  SuperCCD raws, using the scaling interpolator instead of the warp
+  interpolator set in the preferences, as the other rotating and
+  distorting modules do.
+
 ## Lua
 
 ### API Version
