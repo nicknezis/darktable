@@ -812,6 +812,10 @@ changes (where available).
   the chromaticity, hue, color or HSV blend modes in display RGB, where
   OpenCL gave the right color.
 
+- Fixed inpaint opposed highlight reconstruction on linear raws, such
+  as sRAW and linear DNG, taking the clipped areas of every channel
+  from the red channel alone.
+
 ## Lua
 
 ### API Version
