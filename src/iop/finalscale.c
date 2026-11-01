@@ -95,6 +95,19 @@ void modify_roi_in(dt_iop_module_t *self,
   roi_in->height = MAX(16, MIN(ceilf(roi_out->height / roi_out->scale),
                                piece->buf_in.height));
 
+  // a tile must reach the input row and column under its last output pixel;
+  // the truncated x/y above can leave its far edge one short of that, and
+  // at the image border no overlap makes up for it
+  if(piece->pipe->tiling)
+  {
+    const int x_end = ceilf((roi_out->x + roi_out->width) / roi_out->scale);
+    const int y_end = ceilf((roi_out->y + roi_out->height) / roi_out->scale);
+    roi_in->width = MAX(roi_in->width,
+                        MIN(x_end, piece->buf_in.width) - roi_in->x);
+    roi_in->height = MAX(roi_in->height,
+                         MIN(y_end, piece->buf_in.height) - roi_in->y);
+  }
+
   roi_in->scale = 1.0f;
 
   if(_gui_fullpipe(piece))
