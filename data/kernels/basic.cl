@@ -494,6 +494,76 @@ kernel void highlights_opposed(read_only image2d_t in,
   write_imagef(out, (int2)(x, y), val);
 }
 
+// linear raws, see _process_linear_opposed() in src/iop/hlreconstruct/opposed.c
+static float _calc_linear_refavg(const float4 pixel, const int color)
+{
+  const float ins[3] = { cbrt(fmax(0.0f, pixel.x)), cbrt(fmax(0.0f, pixel.y)), cbrt(fmax(0.0f, pixel.z)) };
+  const float opp[3] = { 0.5f*(ins[1]+ins[2]), 0.5f*(ins[0]+ins[2]), 0.5f*(ins[0]+ins[1]) };
+  return fcube(opp[color]);
+}
+
+// a mask cell covers 3x3 pixels; the last row and column of cells also take
+// the pixels left over by the division, as _raw_to_cmap() clamps to them
+kernel void highlights_initmask_linear(read_only image2d_t in,
+                                       global char *inmask,
+                                       const int msize,
+                                       const int mwidth,
+                                       const int mheight,
+                                       const int iwidth,
+                                       const int iheight,
+                                       const float4 clips)
+{
+  const int mcol = get_global_id(0);
+  const int mrow = get_global_id(1);
+
+  if(mcol >= mwidth || mrow >= mheight)
+    return;
+
+  const int irow = 3*mrow;
+  const int icol = 3*mcol;
+  const int rowend = mrow == mheight - 1 ? iheight : irow + 3;
+  const int colend = mcol == mwidth - 1 ? iwidth : icol + 3;
+  char mbuff[3] = { 0, 0, 0 };
+
+  for(int y = irow; y < rowend; y++)
+  {
+    for(int x = icol; x < colend; x++)
+    {
+      // the CPU code tests the red channel against all three clip values
+      const float val = readpixel(in, x, y).x;
+      mbuff[0] |= val >= clips.x;
+      mbuff[1] |= val >= clips.y;
+      mbuff[2] |= val >= clips.z;
+    }
+  }
+
+  const int mdx = mad24(mrow, mwidth, mcol);
+  for(int c = 0; c < 3; c++)
+    inmask[c*msize + mdx] = mbuff[c] ? 1 : 0;
+}
+
+kernel void highlights_opposed_linear(read_only image2d_t in,
+                                      write_only image2d_t out,
+                                      const int width,
+                                      const int height,
+                                      const float4 clips,
+                                      const float4 chroma)
+{
+  const int x = get_global_id(0);
+  const int y = get_global_id(1);
+  if(x >= width || y >= height) return;
+
+  const float4 pixel = readpixel(in, x, y);
+  const float clip[3] = { clips.x, clips.y, clips.z };
+  const float chr[3] = { chroma.x, chroma.y, chroma.z };
+  const float inval[3] = { fmax(0.0f, pixel.x), fmax(0.0f, pixel.y), fmax(0.0f, pixel.z) };
+  float oval[3];
+  for(int c = 0; c < 3; c++)
+    oval[c] = inval[c] >= clip[c] ? fmax(inval[c], _calc_linear_refavg(pixel, c) + chr[c]) : inval[c];
+
+  write_imagef(out, (int2)(x, y), (float4)(oval[0], oval[1], oval[2], pixel.w));
+}
+
 #define SQRT3 1.7320508075688772935274463415058723669f
 #define SQRT12 3.4641016151377545870548926830117447339f // 2*SQRT3
 kernel void
