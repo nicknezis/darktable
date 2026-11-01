@@ -62,6 +62,37 @@ static inline gboolean _gui_fullpipe(dt_dev_pixelpipe_iop_t *piece)
      && darktable.develop->late_scaling.enabled;
 }
 
+static float _tiling_factor(const dt_iop_roi_t *const roi_in,
+                            const dt_iop_roi_t *const roi_out)
+{
+  const float ioratio
+      = (float)(roi_out->width * roi_out->height) / (float)(roi_in->width * roi_in->height);
+
+  // approximate extra requirements for interpolation
+  return 1.0f + ioratio + (ioratio != 1.0f ? 0.5f : 0.0f);
+}
+
+#ifdef HAVE_OPENCL
+// a tiled upscale reads every output tile back to the host, which is no
+// faster than the CPU path, and slower over PCIe, so the device only
+// upscales what it holds untiled
+static gboolean _upscale_fits_device(const dt_dev_pixelpipe_iop_t *piece,
+                                     const dt_iop_roi_t *const roi_in,
+                                     const dt_iop_roi_t *const roi_out)
+{
+  const int devid = piece->pipe->devid;
+  if(!darktable.opencl->inited || devid < 0) return FALSE;
+
+  const dt_opencl_device_t *dev = &darktable.opencl->dev[devid];
+  if(roi_out->width > dev->max_image_width || roi_out->height > dev->max_image_height)
+    return FALSE;
+
+  const float needed = 4.0f * sizeof(float) * roi_in->width * roi_in->height
+                       * _tiling_factor(roi_in, roi_out);
+  return needed < (float)dt_opencl_get_device_available(devid);
+}
+#endif
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *const roi_out,
@@ -95,6 +126,19 @@ void modify_roi_in(dt_iop_module_t *self,
   roi_in->height = MAX(16, MIN(ceilf(roi_out->height / roi_out->scale),
                                piece->buf_in.height));
 
+  // a tile must reach the input row and column under its last output pixel;
+  // the truncated x/y above can leave its far edge one short of that, and
+  // at the image border no overlap makes up for it
+  if(piece->pipe->tiling)
+  {
+    const int x_end = ceilf((roi_out->x + roi_out->width) / roi_out->scale);
+    const int y_end = ceilf((roi_out->y + roi_out->height) / roi_out->scale);
+    roi_in->width = MAX(roi_in->width,
+                        MIN(x_end, piece->buf_in.width) - roi_in->x);
+    roi_in->height = MAX(roi_in->height,
+                         MIN(y_end, piece->buf_in.height) - roi_in->y);
+  }
+
   roi_in->scale = 1.0f;
 
   if(_gui_fullpipe(piece))
@@ -104,6 +148,18 @@ void modify_roi_in(dt_iop_module_t *self,
     roi_in->width = piece->buf_in.width;
     roi_in->height = piece->buf_in.height;
   }
+
+#ifdef HAVE_OPENCL
+  // process_cl_ready also gates process_slang(), which has its own tiler and
+  // keeps the image on the device
+  gboolean on_slang = FALSE;
+#ifdef HAVE_SLANG_GPU
+  on_slang = piece->pipe->slang_enabled && dt_slang_gpu_enabled();
+#endif
+  if(roi_out->scale > 1.0f && !piece->pipe->tiling && !on_slang
+     && !_upscale_fits_device(piece, roi_in, roi_out))
+    piece->process_cl_ready = FALSE;
+#endif
 }
 
 void tiling_callback(dt_iop_module_t *self,
@@ -112,11 +168,7 @@ void tiling_callback(dt_iop_module_t *self,
                      const dt_iop_roi_t *roi_out,
                      struct dt_develop_tiling_t *tiling)
 {
-  const float ioratio
-      = (float)(roi_out->width * roi_out->height) / (float)(roi_in->width * roi_in->height);
-
-  tiling->factor = 1.0f + ioratio;
-  tiling->factor += ioratio != 1.0f ? 0.5f : 0.0f; // approximate extra requirements for interpolation
+  tiling->factor = _tiling_factor(roi_in, roi_out);
   tiling->factor_cl = tiling->factor;
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = tiling->maxbuf;
@@ -169,10 +221,14 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
+  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
+  // as process_cl(): a tile of an export is placed by its roi offsets
+  if(dt_pipe_is_export(piece->pipe) && piece->pipe->tiling)
+    return !dt_interpolation_resample_tile_slang(itor, dev_out, roi_out, dev_in, roi_in);
+
   // the export pipe's buffers hold exactly the rois, as in dt_iop_clip_and_zoom_roi()
   dt_iop_roi_t iroi = *roi_in, oroi = *roi_out;
   if(dt_pipe_is_export(piece->pipe)) iroi.x = iroi.y = oroi.x = oroi.y = 0;
-  const dt_interpolation_t *itor = dt_interpolation_new(DT_INTERPOLATION_USERPREF);
   return !dt_interpolation_resample_slang(itor, dev_out, &oroi, dev_in, &iroi);
 }
 #endif
