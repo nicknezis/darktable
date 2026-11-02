@@ -146,6 +146,121 @@ static inline void _sum_taps(const float *const restrict c1,
   copy_pixel_nontemporal(pcoarse + 4*i,sum);                                  				     \
   accumulate(pdetail + 4*i, det, threshold, boost);							     \
 
+// exp(-sharpen * d^2) is the same seen from either pixel of a pair, so
+// the interior pixels compute it only for the 12 taps after the center,
+// and take the other 12 from the pixel at the far end of that tap. Rows
+// only pair up with rows of the same residue modulo mult, so each task
+// walks a run of those rows and keeps the weights of the last 3 of them
+static void _eaw_interior_shared(float *const restrict out,
+                                 const float *const restrict in,
+                                 float *const restrict accum,
+                                 const int mult,
+                                 const float sharpen,
+                                 const float filter[25],
+                                 const dt_aligned_pixel_t threshold,
+                                 const dt_aligned_pixel_t boost,
+                                 const ssize_t width,
+                                 const ssize_t height)
+{
+  const ssize_t boundary = 2 * mult;
+  if(height <= 2 * boundary || width <= 2 * boundary) return;
+
+  // per row: wl of each of the 12 forward taps for all pixels, then their wc
+  const size_t pitch = ((size_t)width + 15) & ~(size_t)15;
+  const size_t rowlen = 24 * pitch;
+  const float s = -sharpen * 1.44269504f; // exp(x) = 2^(x / ln(2))
+  const size_t run = 16;
+  const size_t nrows = (height + mult - 1) / mult;
+  const size_t nruns = (nrows + run - 1) / run;
+
+  DT_OMP_FOR()
+  for(size_t task = 0; task < (size_t)mult * nruns; task++)
+  {
+    const size_t res = task % mult;
+    const size_t t0 = (task / mult) * run;
+    float *const wbuf = dt_calloc_align_float(3 * rowlen);
+    if(!wbuf) continue;
+
+    for(size_t t = t0 >= 2 ? t0 - 2 : 0; t < t0 + run; t++)
+    {
+      const ssize_t r = res + (ssize_t)mult * t;
+      if(r >= height - boundary) break;
+
+      float *const wrow = wbuf + (t % 3) * rowlen;
+      for(int f = 0; f < 12; f++)
+      {
+        // tap 13 + f, and only the pixels whose tap lies inside the image
+        const ssize_t dx = mult * ((13 + f) % 5 - 2);
+        const ssize_t dy = mult * ((13 + f) / 5 - 2);
+        const ssize_t x0 = MAX(0, -dx);
+        const ssize_t x1 = MIN(width, width - dx);
+        const float *const restrict c1 = in + 4 * r * width;
+        const float *const restrict c2 = in + 4 * (r + dy) * width;
+        float *const restrict wl = wrow + f * pitch;
+        float *const restrict wc = wrow + (12 + f) * pitch;
+        DT_OMP_SIMD()
+        for(ssize_t x = x0; x < x1; x++)
+        {
+          const float dl = c1[4*x] - c2[4*(x+dx)];
+          const float da = c1[4*x+1] - c2[4*(x+dx)+1];
+          const float db = c1[4*x+2] - c2[4*(x+dx)+2];
+          const float el = s * dl * dl;
+          const float ec = s * (da * da + db * db);
+          wl[x] = el > -126.0f ? el : -126.0f;
+          wc[x] = ec > -126.0f ? ec : -126.0f;
+        }
+      }
+      _exp2_nonpositive(wrow, rowlen);
+
+      if(t < t0 || r < boundary) continue;
+
+      const float *const restrict px = in + 4 * r * width;
+      float *const restrict pdetail = accum + 4 * r * width;
+      float *const restrict pcoarse = out + 4 * r * width;
+      for(ssize_t i = boundary; i < width - boundary; i++)
+      {
+        float w[64] DT_ALIGNED_ARRAY;
+        for(int k = 0; k < 12; k++)
+        {
+          // the pixel at the other end sees this one as its tap 24 - k
+          const float *const wq = wbuf + ((t + 3 + k / 5 - 2) % 3) * rowlen
+                                  + i + mult * (k % 5 - 2);
+          w[k] = wq[(11 - k) * pitch];
+          w[32 + k] = wq[(23 - k) * pitch];
+        }
+        w[12] = w[32 + 12] = 1.0f;
+        for(int k = 13; k < 25; k++)
+        {
+          w[k] = wrow[(k - 13) * pitch + i];
+          w[32 + k] = wrow[(k - 1) * pitch + i];
+        }
+        dt_aligned_pixel_t sum = { 0.0f, 0.0f, 0.0f, 0.0f };
+        dt_aligned_pixel_t wgt = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for(int k = 0; k < 25; k++)
+        {
+          const float *const tap = in + 4 * ((r + mult * (k / 5 - 2)) * width + i + mult * (k % 5 - 2));
+          const float f = filter[k];
+          const dt_aligned_pixel_t wk = { f * w[k], f * w[32 + k], f * w[32 + k], f };
+          for_four_channels(c)
+          {
+            wgt[c] += wk[c];
+            sum[c] += wk[c] * tap[c];
+          }
+        }
+        dt_aligned_pixel_t det;
+        for_each_channel(c)
+        {
+          sum[c] /= wgt[c];
+          det[c] = (px[4*i+c] - sum[c]);
+        }
+        copy_pixel_nontemporal(pcoarse + 4*i, sum);
+        accumulate(pdetail + 4*i, det, threshold, boost);
+      }
+    }
+    dt_free_align(wbuf);
+  }
+}
+
 void eaw_decompose_and_synthesize(float *const restrict out,
                                   const float *const restrict in,
                                   float *const restrict accum,
@@ -202,6 +317,9 @@ void eaw_decompose_and_synthesize(float *const restrict out,
       SUM_PIXEL_EPILOGUE;
     }
 
+    // with edge sharpness, _eaw_interior_shared() does these
+    if(!flat && j >= boundary && j < height - boundary) i = MAX(i, width - boundary);
+
     /* For pixels [2*mult, width-2*mult], we don't need to do any boundary checks */
     for( ; i < width - boundary; i++)
     {
@@ -239,6 +357,9 @@ void eaw_decompose_and_synthesize(float *const restrict out,
       SUM_PIXEL_EPILOGUE;
     }
   }
+
+  if(!flat)
+    _eaw_interior_shared(out, in, accum, mult, sharpen, filter, threshold, boost, width, height);
 }
 
 void eaw_synthesize(float *const out, const float *const in, const float *const restrict detail,
