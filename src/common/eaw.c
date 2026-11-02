@@ -82,29 +82,21 @@ static inline void _sum_taps(const float *const restrict c1,
   // wl = exp(-sharpen * SQR(c1[0] - c2[0])) in w[k],
   // wc = exp(-sharpen * (SQR(c1[1] - c2[1]) + SQR(c1[2] - c2[2]))) in w[32 + k]
   float w[64] DT_ALIGNED_ARRAY;
-  if(sharpen == 0.0f)
+  const float s = -sharpen * 1.44269504f; // exp(x) = 2^(x / ln(2))
+  for(size_t k = 0; k < 25; k++)
   {
-    // every weight is exp(0) = 1
-    for(size_t k = 0; k < 64; k++) w[k] = 1.0f;
+    const float dl = c1[0] - tap[k][0];
+    const float da = c1[1] - tap[k][1];
+    const float db = c1[2] - tap[k][2];
+    // clamped here, not in _exp2_nonpositive(): there it keeps
+    // the loop from vectorizing
+    const float wl = s * dl * dl;
+    const float wc = s * (da * da + db * db);
+    w[k] = wl > -126.0f ? wl : -126.0f;
+    w[32 + k] = wc > -126.0f ? wc : -126.0f;
   }
-  else
-  {
-    const float s = -sharpen * 1.44269504f; // exp(x) = 2^(x / ln(2))
-    for(size_t k = 0; k < 25; k++)
-    {
-      const float dl = c1[0] - tap[k][0];
-      const float da = c1[1] - tap[k][1];
-      const float db = c1[2] - tap[k][2];
-      // clamped here, not in _exp2_nonpositive(): there it keeps
-      // the loop from vectorizing
-      const float wl = s * dl * dl;
-      const float wc = s * (da * da + db * db);
-      w[k] = wl > -126.0f ? wl : -126.0f;
-      w[32 + k] = wc > -126.0f ? wc : -126.0f;
-    }
-    _exp2_nonpositive(w, 25);
-    _exp2_nonpositive(w + 32, 25);
-  }
+  _exp2_nonpositive(w, 25);
+  _exp2_nonpositive(w + 32, 25);
   for(size_t k = 0; k < 25; k++)
   {
     const float f = filter[k];
@@ -117,8 +109,22 @@ static inline void _sum_taps(const float *const restrict c1,
   }
 }
 
+// without edge sharpness every weight is exp(0) = 1, so accumulate
+// right away instead of collecting the taps for _sum_taps()
 #define SUM_PIXEL_CONTRIBUTION \
-  tap[filter_idx++] = px2
+  do \
+  { \
+    if(flat) \
+    { \
+      const float f = filter[filter_idx]; \
+      for_four_channels(c, aligned(px2)) \
+      { \
+        wgt[c] += f; \
+        sum[c] += f * px2[c]; \
+      } \
+    } \
+    tap[filter_idx++] = px2; \
+  } while(0)
 
 #define SUM_PIXEL_PROLOGUE                                                                                   \
   dt_aligned_pixel_t sum = { 0.0f, 0.0f, 0.0f, 0.0f };                                                       \
@@ -130,7 +136,7 @@ static inline void _sum_taps(const float *const restrict c1,
   const float *tap[25];
 
 #define SUM_PIXEL_EPILOGUE                                                                                   \
-  _sum_taps(px + 4*i, tap, filter, sharpen, sum, wgt); \
+  if(!flat) _sum_taps(px + 4*i, tap, filter, sharpen, sum, wgt); \
   dt_aligned_pixel_t det;										     \
   for_each_channel(c)      										     \
   {													     \
@@ -160,6 +166,7 @@ void eaw_decompose_and_synthesize(float *const restrict out,
       1.0f / 256.0f,  4.0f / 256.0f,  6.0f / 256.0f,  4.0f / 256.0f, 1.0f / 256.0f
     };
   const int boundary = 2 * mult;
+  const gboolean flat = sharpen == 0.0f;
 
   DT_OMP_FOR()
   for(size_t rowid = 0; rowid < height; rowid++)
