@@ -82,16 +82,25 @@ static inline void _sum_taps(const float *const restrict c1,
   // wl = exp(-sharpen * SQR(c1[0] - c2[0])) in w[k],
   // wc = exp(-sharpen * (SQR(c1[1] - c2[1]) + SQR(c1[2] - c2[2]))) in w[32 + k]
   float w[64] DT_ALIGNED_ARRAY;
-  const float s = -sharpen * 1.44269504f; // exp(x) = 2^(x / ln(2))
+  float dl[32] DT_ALIGNED_ARRAY;
+  float da[32] DT_ALIGNED_ARRAY;
+  float db[32] DT_ALIGNED_ARRAY;
+  // the loads through tap[] keep the weight loop from vectorizing,
+  // so copy the differences out first
   for(size_t k = 0; k < 25; k++)
   {
-    const float dl = c1[0] - tap[k][0];
-    const float da = c1[1] - tap[k][1];
-    const float db = c1[2] - tap[k][2];
+    dl[k] = c1[0] - tap[k][0];
+    da[k] = c1[1] - tap[k][1];
+    db[k] = c1[2] - tap[k][2];
+  }
+  const float s = -sharpen * 1.44269504f; // exp(x) = 2^(x / ln(2))
+  DT_OMP_SIMD(aligned(w, dl, da, db:64))
+  for(size_t k = 0; k < 25; k++)
+  {
     // clamped here, not in _exp2_nonpositive(): there it keeps
     // the loop from vectorizing
-    const float wl = s * dl * dl;
-    const float wc = s * (da * da + db * db);
+    const float wl = s * dl[k] * dl[k];
+    const float wc = s * (da[k] * da[k] + db[k] * db[k]);
     w[k] = wl > -126.0f ? wl : -126.0f;
     w[32 + k] = wc > -126.0f ? wc : -126.0f;
   }
