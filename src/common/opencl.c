@@ -28,6 +28,7 @@
 #include "common/gaussian.h"
 #include "common/guided_filter.h"
 #include "common/heal.h"
+#include "common/histogram.h"
 #include "common/interpolation.h"
 #include "common/locallaplaciancl.h"
 #include "common/opencl_drivers_blacklist.h"
@@ -1585,6 +1586,7 @@ finally:
     cl->heal = dt_heal_init_cl_global();
     cl->colorspaces = dt_colorspaces_init_cl_global();
     cl->guided_filter = dt_guided_filter_init_cl_global();
+    cl->histogram = dt_histogram_init_cl_global();
 
     char checksum[64];
     snprintf(checksum, sizeof(checksum), "%u", cl->crc);
@@ -1639,6 +1641,7 @@ void dt_opencl_cleanup(dt_opencl_t *cl)
     dt_heal_free_cl_global(cl->heal);
     dt_colorspaces_free_cl_global(cl->colorspaces);
     dt_guided_filter_free_cl_global(cl->guided_filter);
+    dt_histogram_free_cl_global(cl->histogram);
     dt_local_laplacian_free_cl_global(cl->local_laplacian);
     for(int i = 0; i < cl->num_devs; i++)
     {
