@@ -374,8 +374,9 @@ static void _opencl_write_device_config(const int devid)
            "[opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
   dt_conf_set_string(key, dat);
 
-  // Take care of headroom, this is defined per device and devid to support systems with two similar cards.
-  g_snprintf(key, sizeof(key), "%s%s_id%i", DT_CLDEVICE_HEAD, cl->dev[devid].cname, devid);
+  // Take care of headroom, this is defined per device and the driver's device position to support systems
+  // with two similar cards. Unlike devid, the position does not change when dt_opencl_init() renumbers the devices
+  g_snprintf(key, sizeof(key), "%s%s_id%i", DT_CLDEVICE_HEAD, cl->dev[devid].cname, cl->dev[devid].driver_id);
   g_snprintf(dat, sizeof(dat), "headroom: %i", cl->dev[devid].headroom);
   dt_print_nts(DT_DEBUG_OPENCL | DT_DEBUG_VERBOSE,
            "[opencl_write_device_config] writing data '%s' for '%s'\n", dat, key);
@@ -441,7 +442,7 @@ static gboolean _opencl_read_device_config(const int devid)
   cldid->avoid = dt_conf_key_not_empty(key) ? dt_conf_get_string(key) : NULL;
 
   // Take care of headroom
-  g_snprintf(key, sizeof(key), "%s%s_id%i", DT_CLDEVICE_HEAD, cldid->cname, devid);
+  g_snprintf(key, sizeof(key), "%s%s_id%i", DT_CLDEVICE_HEAD, cldid->cname, cldid->driver_id);
   if(dt_conf_key_not_empty(key))
   {
     const gchar *dat = dt_conf_get_string_const(key);
@@ -1527,29 +1528,42 @@ void dt_opencl_init(dt_opencl_t *cl,
   // discrete one. The default priorities give device 0 to the darkroom
   // and export pipes
   int *rank = malloc(sizeof(int) * num_devices);
-  if(rank)
+  int *driver_id = malloc(sizeof(int) * num_devices);
+  if(rank && driver_id)
   {
     for(int k = 0; k < num_devices; k++)
+    {
       rank[k] = _opencl_device_rank(cl, devices[k]);
+      driver_id[k] = k;
+    }
     for(int k = 1; k < num_devices; k++)
     {
       const cl_device_id d = devices[k];
       const int r = rank[k];
+      const int id = driver_id[k];
       int j = k - 1;
       for(; j >= 0 && rank[j] > r; j--)
       {
         devices[j + 1] = devices[j];
         rank[j + 1] = rank[j];
+        driver_id[j + 1] = driver_id[j];
       }
       devices[j + 1] = d;
       rank[j + 1] = r;
+      driver_id[j + 1] = id;
     }
-    free(rank);
   }
+  else
+  {
+    free(driver_id);
+    driver_id = NULL;
+  }
+  free(rank);
 
   int dev = 0;
   for(int k = 0; k < num_devices; k++)
   {
+    cl->dev[dev].driver_id = driver_id ? driver_id[k] : k;
     if(_opencl_device_init(cl, dev, devices, k))
       continue;
     // increase dev only if _opencl_device_init was successful
@@ -1557,6 +1571,7 @@ void dt_opencl_init(dt_opencl_t *cl,
   }
   free(devices);
   devices = NULL;
+  free(driver_id);
 
   if(dev > 0)
   {
@@ -1955,16 +1970,21 @@ static void _opencl_priority_parse(dt_opencl_t *cl,
     if(all)
     {
       // copy all remaining device numbers from full to priority list.
-      // CPU devices are left out: they can still be chosen by number or
-      // name, but macOS' one fails to allocate images and its exports
-      // came out wrong
+      // CPU devices are left out: macOS' one fails to allocate images and
+      // its exports came out wrong. They stay in full so that a later
+      // token, as in '*,1', can still choose them by number or name
+      int left = 0;
       for(int i = 0; i < devs && full[i] != -1; i++)
       {
-        if(cl->dev[full[i]].cpu_device) continue;
-        priority_list[count] = full[i];
-        count++;
+        if(cl->dev[full[i]].cpu_device)
+          full[left++] = full[i];
+        else
+        {
+          priority_list[count] = full[i];
+          count++;
+        }
       }
-      full[0] = -1; // mark full list as empty
+      full[left] = -1;
     }
     else if(*str != '\0')
     {
@@ -3891,6 +3911,19 @@ gboolean dt_opencl_running_fast(void)
   return _cl_running() ? darktable.opencl->fastcl : FALSE;
 }
 
+// is the device in any pipe's priority list?
+static gboolean _opencl_device_scheduled(dt_opencl_t *cl,
+                                         const int devid)
+{
+  const int *lists[] = { cl->dev_priority_image, cl->dev_priority_preview,
+                         cl->dev_priority_preview2, cl->dev_priority_export,
+                         cl->dev_priority_thumbnail };
+  for(int l = 0; l < G_N_ELEMENTS(lists); l++)
+    for(const int *p = lists[l]; p && *p != -1; p++)
+      if(*p == devid) return TRUE;
+  return FALSE;
+}
+
 /** update enabled flag and profile with value from preferences */
 void dt_opencl_update_settings(void)
 {
@@ -3949,7 +3982,10 @@ void dt_opencl_update_settings(void)
     if(cl->dev[i].unified_memory)
     {
       cl->dev[i].used_available = MIN(cl->dev[i].used_available, res->total_memory * cl->dev[i].unified_fraction);
-      res->cl_uni_memory += cl->dev[i].used_available;
+      // a CPU device left out of every priority list never runs a pipe,
+      // so it must not withhold system memory from darktable
+      if(!cl->dev[i].cpu_device || _opencl_device_scheduled(cl, i))
+        res->cl_uni_memory += cl->dev[i].used_available;
     }
     dt_print_nts(DT_DEBUG_OPENCL,
          "   AVAILABLE MEM SIZE:       %zu MB%s\n",
