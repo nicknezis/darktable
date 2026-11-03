@@ -176,6 +176,8 @@ typedef struct dt_opencl_device_t
   // keep track of devices using unified memory so we can adopt
   // runtime code
   gboolean unified_memory;
+  // the device is the host CPU, like macOS' or PoCL's CPU device
+  gboolean cpu_device;
   // fraction of system memory allowed for a device in percent
   float unified_fraction;
 
