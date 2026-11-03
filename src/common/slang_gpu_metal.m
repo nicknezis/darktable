@@ -75,6 +75,7 @@ typedef struct dt_slang_metal_t
   __strong NSMutableArray *staging;       // transfer buffers, see _staging_get()
   NSUInteger max_image_dim;
   gboolean private_storage; // device images and buffers in private storage
+  GArray *freed_aliases;    // host ranges of freed aliased images, see dt_slang_gpu_image_alias()
 } dt_slang_metal_t;
 
 static dt_slang_metal_t _mtl = { 0 };
@@ -107,6 +108,7 @@ static gboolean _init_device(void)
   _mtl.images = [NSMutableArray array];
   _mtl.buffers = [NSMutableArray array];
   _mtl.staging = [NSMutableArray array];
+  _mtl.freed_aliases = g_array_new(FALSE, FALSE, sizeof(uintptr_t));
   // shared storage is system memory on a discrete GPU, so kernels working
   // there would read and write every pixel over PCIe
   _mtl.private_storage = !_mtl.dev.hasUnifiedMemory || dt_conf_get_bool("slang_gpu_private_memory");
@@ -141,6 +143,8 @@ void dt_slang_gpu_cleanup(void)
   g_mutex_lock(&_mtl_lock);
   for(id<MTLCommandBuffer> cb in _mtl.inflight) [cb waitUntilCompleted];
   _mtl.inflight = nil;
+  if(_mtl.freed_aliases) g_array_free(_mtl.freed_aliases, TRUE);
+  _mtl.freed_aliases = NULL;
   _mtl.images = nil;
   _mtl.buffers = nil;
   g_mutex_lock(&_staging_lock);
@@ -487,6 +491,13 @@ static void _commit(id<MTLCommandBuffer> cb)
   if(!_mtl.inflight) _mtl.inflight = [NSMutableArray array];
   [_mtl.inflight addObject:cb];
   _check(FALSE);
+}
+
+// waits for every committed command buffer, leaving any failure for the
+// next _check() to report
+static void _wait_inflight(void)
+{
+  for(id<MTLCommandBuffer> cb in _mtl.inflight) [cb waitUntilCompleted];
 }
 
 // waits for every committed command buffer. Returns FALSE if one failed.
@@ -877,6 +888,25 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_alias(const int width,
   if(_mtl.private_storage) return NULL;
   DtSlangImage *img;
   g_mutex_lock(&_mtl_lock);
+  // the pipe cache hands out the memory of a freed cacheline again, which a
+  // kernel still queued may read through its own alias. Metal tracks hazards
+  // per buffer object, not per memory, so it would let a kernel writing the
+  // new alias overlap that read: wait for the queue first.
+  _check(FALSE);
+  if(!_mtl.inflight.count)
+    g_array_set_size(_mtl.freed_aliases, 0);
+  const uintptr_t start = (uintptr_t)host;
+  const uintptr_t end = start + sizeof(float) * channels * width * height;
+  for(guint i = 0; i < _mtl.freed_aliases->len; i += 2)
+  {
+    const uintptr_t *r = &g_array_index(_mtl.freed_aliases, uintptr_t, i);
+    if(start < r[1] && r[0] < end)
+    {
+      _wait_inflight();
+      g_array_set_size(_mtl.freed_aliases, 0);
+      break;
+    }
+  }
   @autoreleasepool
   {
     img = _image_wrap(host, width, height, channels);
@@ -929,7 +959,15 @@ void dt_slang_gpu_image_free(dt_slang_gpu_image_t *image)
   if(!image) return;
   DtSlangImage *img = CFBridgingRelease(image);
   // a pending command buffer keeps the buffer, and the caller the memory
-  if(img->aliased) return;
+  if(img->aliased)
+  {
+    const uintptr_t range[2] = { (uintptr_t)img->buffer.contents,
+                                 (uintptr_t)img->buffer.contents + img->buffer.length };
+    g_mutex_lock(&_mtl_lock);
+    if(_mtl.freed_aliases) g_array_append_vals(_mtl.freed_aliases, range, 2);
+    g_mutex_unlock(&_mtl_lock);
+    return;
+  }
   g_mutex_lock(&_mtl_lock);
   // the caller may reuse the memory of a wrapped image as soon as we return,
   // and it belongs to the caller, so it never goes to the pool
