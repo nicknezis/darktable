@@ -178,6 +178,9 @@ typedef struct dt_opencl_device_t
   gboolean unified_memory;
   // the device is the host CPU, like macOS' or PoCL's CPU device
   gboolean cpu_device;
+  // position in the driver's device list, before dt_opencl_init()
+  // renumbers the devices; keys the saved headroom
+  int driver_id;
   // fraction of system memory allowed for a device in percent
   float unified_fraction;
 
