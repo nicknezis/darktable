@@ -121,6 +121,7 @@ typedef struct dt_iop_contrastntexture_data_t
   float feathering;
   float slope_shadows;
   float slope_highlights;
+  float midtones_pivot;
   float midtones_width;
   float midtones_polynomial[3];
 } dt_iop_contrastntexture_data_t;
@@ -272,14 +273,14 @@ static inline void compute_mask(float *const restrict log_smoothed_luminance,
 }
 
 // Extract logarithmic high pass detail in log space (EV):
-// How much brighter/darker is this pixel compared to the smooth version
+// How much brighter/darker is this pixel compared to the smooth version.
+// The caller supplies the smoothed luminance in linear space too, as it needs it as well.
 __DT_CLONE_TARGETS__
 static inline float extract_details(const float log_luminance_pixel,
                                     const float log_luminance_smoothed,
-                                    const float noise_bias)
+                                    const float smoothed_luminance,
+                                    const float noise_power)
 {
-  const float noise_power = noise_bias * noise_bias;
-  const float smoothed_luminance = exp2f(log_luminance_smoothed);
   const float combined_power = smoothed_luminance * smoothed_luminance;
   const float wiener_gain = fmaxf(combined_power - noise_power, 0.0f) / fmaxf(combined_power, NORM_MIN);
   return wiener_gain * fmaxf(fminf(log_luminance_pixel - log_luminance_smoothed, 5.0f), -5.0f);
@@ -327,8 +328,7 @@ static inline float apply_shadows_highlights(const float log_luminance_lowpass,
   const float a0 = d->midtones_polynomial[0];
   const float a1 = d->midtones_polynomial[1];
   const float a2 = d->midtones_polynomial[2];
-  const float noise_bias = d->noise_bias[0]; // Applied on pyramid level 0, the base detail level
-  const float pivot_offset = log2f(noise_bias + MIDDLE_GREY);
+  const float pivot_offset = d->midtones_pivot;
 
   float correction_ev = 0.0f;
   // Low pass correction for shadows and highlights
@@ -501,19 +501,27 @@ void process(dt_iop_module_t *self,
     memcpy(log_luminance_highpass, log_luminance_lowpass, npixels * sizeof(float));
     compute_mask(log_luminance_lowpass, roi_in, d, pyramid_level);
 
+    const float level_gain = gain_per_pyramid_level[pyramid_level];
+    const float noise_power = d->noise_bias[pyramid_level] * d->noise_bias[pyramid_level];
+    const float bias_diff = pyramid_level > 0
+                            ? d->noise_bias[pyramid_level] - d->noise_bias[pyramid_level - 1]
+                            : 0.0f;
+
     DT_OMP_FOR()
     for(size_t k = 0; k < npixels; k++)
     {
+      const float smoothed_luminance = exp2f(log_luminance_lowpass[k]);
+
       // Details as the bandpass difference
-      corrections[k] += gain_per_pyramid_level[pyramid_level]
-                        * extract_details(log_luminance_highpass[k], log_luminance_lowpass[k],
-                                          d->noise_bias[pyramid_level]);
+      corrections[k] += level_gain * extract_details(log_luminance_highpass[k],
+                                                     log_luminance_lowpass[k],
+                                                     smoothed_luminance,
+                                                     noise_power);
 
       // Reduce the noise bias to the next pyramid level
       if(pyramid_level > 0)
       {
-        const float bias_diff = d->noise_bias[pyramid_level] - d->noise_bias[pyramid_level - 1];
-        const float linear_luminance = exp2f(log_luminance_lowpass[k]) - bias_diff;
+        const float linear_luminance = smoothed_luminance - bias_diff;
         log_luminance_lowpass[k] = log2f(fmaxf(linear_luminance, NORM_MIN));
       }
     }
@@ -611,6 +619,8 @@ void commit_params(dt_iop_module_t *self,
     d->noise_bias[pyramid_level]
       = p->noise_bias * powf(2.0f, fminf((float)pyramid_level - d->max_pyramid_level, 0.0f));
   }
+  // Pre-compute the midtones pivot based on the noise bias at the base pyramid level and the middle grey reference.
+  d->midtones_pivot = log2f(d->noise_bias[0] + MIDDLE_GREY);
 
   // UI feathering is inverted (higher = stricter halo control).
   const float default_feathering = 0.2f;  // Base value based on Christian's experiments for a good balance of halo control and contrast boost at default settings.
@@ -1163,6 +1173,7 @@ static gboolean gain_graph_draw(GtkWidget *widget,
   cairo_save(cr);
   cairo_rectangle(cr, 0, 0, width, height);
   cairo_clip(cr);
+  const gboolean lowpass_preview = g->details_display == DT_LC_MASK_LAST;
   const double dashes[] = { DT_PIXEL_APPLY_DPI(5), DT_PIXEL_APPLY_DPI(5) };
   cairo_set_dash(cr, dashes, 2, 0);
   set_color(cr, darktable.bauhaus->graph_overlay);
@@ -1175,7 +1186,9 @@ static gboolean gain_graph_draw(GtkWidget *widget,
     if(pyramid_level == 0)
     {
       cairo_set_dash(cr, NULL, 0, 0);
-      set_color(cr, darktable.bauhaus->graph_fg);
+      // highlighted while the base detail level preview shows the low pass of that level
+      set_color(cr, lowpass_preview ? darktable.bauhaus->graph_fg_active : darktable.bauhaus->graph_fg);
+      if(lowpass_preview) cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(3.0));
     }
     cairo_move_to(cr, GRAPH_X(detail), 0);
     cairo_line_to(cr, GRAPH_X(detail), height);
@@ -1184,6 +1197,7 @@ static gboolean gain_graph_draw(GtkWidget *widget,
     {
       cairo_set_dash(cr, dashes, 2, 0);
       set_color(cr, darktable.bauhaus->graph_overlay);
+      cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
     }
   }
   cairo_restore(cr);
