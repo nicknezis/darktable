@@ -470,6 +470,20 @@ static gboolean _opencl_read_device_config(const int devid)
   return !existing_device || !safety_ok;
 }
 
+// sort key for the device numbering in dt_opencl_init()
+static int _opencl_device_rank(dt_opencl_t *cl,
+                               const cl_device_id devid)
+{
+  cl_device_type type = 0;
+  cl_bool unified_memory = CL_FALSE;
+  (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_TYPE,
+                                           sizeof(cl_device_type), &type, NULL);
+  (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_HOST_UNIFIED_MEMORY,
+                                           sizeof(cl_bool), &unified_memory, NULL);
+  if(type & CL_DEVICE_TYPE_CPU) return 2;
+  return unified_memory ? 1 : 0;
+}
+
 // returns 0 if all ok or an error if we failed to init this device
 static gboolean _opencl_device_init(dt_opencl_t *cl,
                                     const int dev,
@@ -514,6 +528,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   // setting sane/conservative defaults at first
   cl->dev[dev].unified_fraction = 0.25f;
   cl->dev[dev].unified_memory = FALSE;
+  cl->dev[dev].cpu_device = FALSE;
   cl->dev[dev].clroundup_wd = 16;
   cl->dev[dev].clroundup_ht = 16;
   cl->dev[dev].use_events = TRUE;
@@ -756,6 +771,7 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_HOST_UNIFIED_MEMORY,
                                            sizeof(cl_bool), &unified_memory, NULL);
   cl->dev[dev].unified_memory = unified_memory ? TRUE : FALSE;
+  cl->dev[dev].cpu_device = (type & CL_DEVICE_TYPE_CPU) == CL_DEVICE_TYPE_CPU;
 
 #ifndef _opencl_apply_scheduling_profile  // they never supported inline assembling
   if(strstr(platform_display_name, "NVIDIA CUDA"))
@@ -1506,6 +1522,32 @@ void dt_opencl_init(dt_opencl_t *cl,
     goto finally;
   }
 
+  // number the devices dedicated-memory GPUs first, then unified-memory
+  // ones, then CPU devices, as the driver's order says nothing about
+  // speed: macOS lists its CPU device, then the integrated GPU, then the
+  // discrete one. The default priorities give device 0 to the darkroom
+  // and export pipes
+  int *rank = malloc(sizeof(int) * num_devices);
+  if(rank)
+  {
+    for(int k = 0; k < num_devices; k++)
+      rank[k] = _opencl_device_rank(cl, devices[k]);
+    for(int k = 1; k < num_devices; k++)
+    {
+      const cl_device_id d = devices[k];
+      const int r = rank[k];
+      int j = k - 1;
+      for(; j >= 0 && rank[j] > r; j--)
+      {
+        devices[j + 1] = devices[j];
+        rank[j + 1] = rank[j];
+      }
+      devices[j + 1] = d;
+      rank[j + 1] = r;
+    }
+    free(rank);
+  }
+
   int dev = 0;
   for(int k = 0; k < num_devices; k++)
   {
@@ -1913,9 +1955,13 @@ static void _opencl_priority_parse(dt_opencl_t *cl,
 
     if(all)
     {
-      // copy all remaining device numbers from full to priority list
+      // copy all remaining device numbers from full to priority list.
+      // CPU devices are left out: they can still be chosen by number or
+      // name, but macOS' one fails to allocate images and its exports
+      // came out wrong
       for(int i = 0; i < devs && full[i] != -1; i++)
       {
+        if(cl->dev[full[i]].cpu_device) continue;
         priority_list[count] = full[i];
         count++;
       }
