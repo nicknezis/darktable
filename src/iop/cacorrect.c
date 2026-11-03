@@ -26,6 +26,7 @@
 #include "common/darktable.h"
 #include "common/imagebuf.h"
 #include "common/gaussian.h"
+#include "common/opencl.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
 #include "develop/imageop_math.h"
@@ -68,6 +69,19 @@ typedef struct dt_iop_cacorrect_data_t
   gboolean avoidshift;
   uint32_t iterations;
 } dt_iop_cacorrect_data_t;
+
+typedef struct dt_iop_cacorrect_global_data_t
+{
+  int kernel_cacorrect_load;
+  int kernel_cacorrect_store;
+  int kernel_cacorrect_extend;
+  int kernel_cacorrect_green;
+  int kernel_cacorrect_filters;
+  int kernel_cacorrect_tile_sums;
+  int kernel_cacorrect_correct;
+  int kernel_cacorrect_factors;
+  int kernel_cacorrect_apply_factors;
+} dt_iop_cacorrect_global_data_t;
 
 // this returns a translatable name
 const char *name()
@@ -1213,9 +1227,9 @@ DT_OMP_PRAGMA(barrier)
   dt_free_align(oldraw);
 }
 
-#ifdef HAVE_SLANG_GPU
+#if defined(HAVE_SLANG_GPU) || defined(HAVE_OPENCL)
 // the state that process() keeps across iterations, for the host part of
-// process_slang()
+// process_slang() and process_cl()
 typedef struct _cacorrect_fit_t
 {
   int vert_tiles, horiz_tiles;
@@ -1418,6 +1432,9 @@ static void _cacorrect_tile_shifts(const _cacorrect_fit_t *f,
     }
 }
 
+#endif
+
+#ifdef HAVE_SLANG_GPU
 // the colorshift avoidance of process(): the blurred ratios of the red and
 // blue values before and after the correction scale the corrected ones
 static gboolean _cacorrect_avoid_shift(dt_slang_gpu_buffer_t *before,
@@ -1596,6 +1613,268 @@ gboolean process_slang(dt_iop_module_t *self,
   return ok;
 }
 #endif
+
+#ifdef HAVE_OPENCL
+// the colorshift avoidance of process(): the blurred ratios of the red and
+// blue values before and after the correction scale the corrected ones
+static cl_int _cacorrect_avoid_shift_cl(const dt_iop_cacorrect_global_data_t *gd,
+                                        const int devid,
+                                        cl_mem before,
+                                        cl_mem buf,
+                                        const int width,
+                                        const int height,
+                                        const uint32_t filters)
+{
+  const int h_width = (width + 1) / 2;
+  const int h_height = (height + 1) / 2;
+
+  // the row and column parity of the red and the blue sensels, and the plane
+  // that process() completes with the column before its last
+  int prow[3] = { 0 }, pcol[3] = { 0 };
+  for(int row = 0; row < 2; row++)
+  {
+    const int firstCol = FC(row, 0, filters) & 1;
+    const int color = FC(row, firstCol, filters);
+    prow[color] = row;
+    pcol[color] = firstCol;
+  }
+  const int ngRow = 1 - (FC(0, 0, filters) & 1);
+  const int ngCol = FC(ngRow, 0, filters) & 1;
+  const int wcolor = FC(ngRow, ngCol, filters);
+  const int fixrow = height % 2;
+
+  const float valmax[] = { 10.0f };
+  const float valmin[] = { 0.1f };
+
+  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+  cl_mem red = dt_opencl_alloc_device(devid, h_width, h_height, sizeof(float));
+  cl_mem blue = dt_opencl_alloc_device(devid, h_width, h_height, sizeof(float));
+  cl_mem tmp = dt_opencl_alloc_device(devid, h_width, h_height, sizeof(float));
+  if(!red || !blue || !tmp) goto error;
+
+  for(int color = 0; color < 3; color += 2)
+  {
+    cl_mem factors = color == 0 ? red : blue;
+    const int fixcol = width % 2 && color == wcolor;
+    err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_factors, h_width, h_height,
+            CLARG(before), CLARG(buf), CLARG(tmp), CLARG(width), CLARG(height),
+            CLARG(h_width), CLARG(h_height), CLARG(prow[color]), CLARG(pcol[color]),
+            CLARG(fixrow), CLARG(fixcol));
+    if(err != CL_SUCCESS) goto error;
+
+    dt_gaussian_cl_t *g = dt_gaussian_init_cl(devid, h_width, h_height, 1, valmax, valmin, 30.0f, 0);
+    if(!g)
+    {
+      err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+      goto error;
+    }
+    err = dt_gaussian_blur_cl(g, tmp, factors);
+    dt_gaussian_free_cl(g);
+    if(err != CL_SUCCESS) goto error;
+  }
+
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_apply_factors, width, height,
+          CLARG(buf), CLARG(red), CLARG(blue), CLARG(width), CLARG(height), CLARG(filters));
+
+error:
+  dt_opencl_release_mem_object(red);
+  dt_opencl_release_mem_object(blue);
+  dt_opencl_release_mem_object(tmp);
+  return err;
+}
+
+int process_cl(dt_iop_module_t *self,
+               dt_dev_pixelpipe_iop_t *piece,
+               cl_mem dev_in,
+               cl_mem dev_out,
+               const dt_iop_roi_t *const roi_in,
+               const dt_iop_roi_t *const roi_out)
+{
+  const dt_iop_cacorrect_data_t *d = piece->data;
+  const dt_iop_cacorrect_global_data_t *gd = self->global_data;
+  const int devid = piece->pipe->devid;
+  const gboolean run_fast = dt_pipe_is_fast(piece->pipe);
+  const gboolean avoidshift = d->avoidshift && !dt_pipe_is_preview(piece->pipe);
+
+  const uint32_t filters = piece->filters;
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const float scaler = dt_iop_get_processed_maximum(piece);
+  const float inv_scaler = 1.0f / scaler;
+  const int dx = roi_out->x;
+  const int dy = roi_out->y;
+  const int owidth = roi_out->width;
+  const int oheight = roi_out->height;
+
+  const int ewidth = width + 2 * border;
+  const int eheight = height + 2 * border;
+  const int hwidth = (ewidth + 1) / 2;
+  const int step = ts - border2;
+  const int vtiles = (height + border - 1) / step + 1;
+  const int htiles = (width + border - 1) / step + 1;
+
+  const size_t isize = sizeof(float) * width * height;
+  const size_t esize = sizeof(float) * ewidth * eheight;
+  const size_t fsize = sizeof(float) * 6 * eheight * hwidth;
+  if(!run_fast
+     && (avoidshift ? 3 : 2) * isize + 3 * esize + fsize > dt_opencl_get_device_available(devid))
+    return DT_OPENCL_PROCESS_CL;
+
+  cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+  cl_mem cur = dt_opencl_alloc_device_buffer(devid, isize);
+  cl_mem next = NULL, raw = NULL, green = NULL, green2 = NULL, filt = NULL, tsums = NULL;
+  cl_mem before = NULL, dev_shifts = NULL;
+  _cacorrect_fit_t fit = { 0 };
+  float *sums = NULL;
+  float *shifts = NULL;
+  if(!cur) goto error;
+
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_load, width, height,
+          CLARG(dev_in), CLARG(cur), CLARG(width), CLARG(height), CLARG(inv_scaler));
+  if(err != CL_SUCCESS) goto error;
+
+  const int iterations = d->iterations;
+  if(!run_fast && iterations > 0)
+  {
+    err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    next = dt_opencl_alloc_device_buffer(devid, isize);
+    raw = dt_opencl_alloc_device_buffer(devid, esize);
+    green = dt_opencl_alloc_device_buffer(devid, esize);
+    green2 = dt_opencl_alloc_device_buffer(devid, esize);
+    filt = dt_opencl_alloc_device_buffer(devid, fsize);
+    tsums = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 12 * vtiles * htiles);
+    dev_shifts = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * vtiles * htiles);
+    if(!next || !raw || !green || !green2 || !filt || !tsums || !dev_shifts) goto error;
+
+    const int vz1 = (height + border2) % (ts - border2) == 0 ? 1 : 0;
+    const int hz1 = (width + border2) % (ts - border2) == 0 ? 1 : 0;
+    fit.vert_tiles = ceilf((float)(height + border2) / (ts - border2) + 2 + vz1);
+    fit.horiz_tiles = ceilf((float)(width + border2) / (ts - border2) + 2 + hz1);
+    fit.blockwt = dt_calloc_align_float(5 * fit.vert_tiles * fit.horiz_tiles);
+    fit.blockshifts = fit.blockwt ? (float(*)[2][2])(fit.blockwt + fit.vert_tiles * fit.horiz_tiles) : NULL;
+    fit.polyord = 4;
+    fit.numpar = 16;
+    sums = dt_alloc_align_float(12 * vtiles * htiles);
+    shifts = dt_alloc_align_float(4 * vtiles * htiles);
+    err = DT_OPENCL_SYSMEM_ALLOCATION;
+    if(!fit.blockwt || !sums || !shifts) goto error;
+
+    // the values before the correction, for the colorshift avoidance
+    if(avoidshift)
+    {
+      err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+      before = dt_opencl_alloc_device_buffer(devid, isize);
+      if(!before) goto error;
+      err = dt_opencl_enqueue_copy_buffer_to_buffer(devid, cur, before, 0, 0, isize);
+      if(err != CL_SUCCESS) goto error;
+    }
+
+    const int origin = border * ewidth + border;
+    const int zero = 0;
+    const size_t tsizes[2] = { 16 * htiles, 16 * vtiles };
+    const size_t tlocal[2] = { 16, 16 };
+    gboolean processpasstwo = TRUE;
+    for(int it = 0; it < iterations && processpasstwo; it++)
+    {
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_extend, ewidth, eheight,
+              CLARG(cur), CLARG(raw), CLARG(width), CLARG(height), CLARG(zero), CLARG(width));
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_green, ewidth, eheight,
+              CLARG(raw), CLARG(green), CLARG(ewidth), CLARG(eheight), CLARG(filters));
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_filters, hwidth, eheight,
+              CLARG(raw), CLARG(green), CLARG(filt), CLARG(ewidth), CLARG(eheight), CLARG(hwidth),
+              CLARG(filters));
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_enqueue_kernel_2d_local_args(devid, gd->kernel_cacorrect_tile_sums, tsizes, tlocal,
+              CLARG(raw), CLARG(green), CLARG(filt), CLARG(tsums),
+              CLARG(width), CLARG(height), CLARG(hwidth), CLARG(htiles), CLARG(filters),
+              CLLOCAL(sizeof(float) * 12 * 256));
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_read_buffer_from_device(devid, sums, tsums, 0, sizeof(float) * 12 * vtiles * htiles, TRUE);
+      if(err != CL_SUCCESS) goto error;
+
+      processpasstwo = _cacorrect_fit(&fit, sums, vtiles, htiles);
+      if(!processpasstwo) break;
+
+      _cacorrect_tile_shifts(&fit, shifts, vtiles, htiles);
+      err = dt_opencl_write_buffer_to_device(devid, shifts, dev_shifts, 0, sizeof(float) * 4 * vtiles * htiles, TRUE);
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_extend, ewidth, eheight,
+              CLARG(green), CLARG(green2), CLARG(width), CLARG(height), CLARG(origin), CLARG(ewidth));
+      if(err != CL_SUCCESS) goto error;
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_correct, width, height,
+              CLARG(raw), CLARG(green2), CLARG(dev_shifts), CLARG(next),
+              CLARG(width), CLARG(height), CLARG(htiles), CLARG(filters));
+      if(err != CL_SUCCESS) goto error;
+
+      cl_mem t = cur;
+      cur = next;
+      next = t;
+    }
+
+    if(avoidshift && processpasstwo)
+    {
+      err = _cacorrect_avoid_shift_cl(gd, devid, before, cur, width, height, filters);
+      if(err != CL_SUCCESS) goto error;
+    }
+  }
+
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_cacorrect_store, owidth, oheight,
+          CLARG(cur), CLARG(dev_out), CLARG(width), CLARG(owidth), CLARG(oheight),
+          CLARG(dx), CLARG(dy), CLARG(scaler));
+
+error:
+  dt_opencl_release_mem_object(cur);
+  dt_opencl_release_mem_object(next);
+  dt_opencl_release_mem_object(raw);
+  dt_opencl_release_mem_object(green);
+  dt_opencl_release_mem_object(green2);
+  dt_opencl_release_mem_object(filt);
+  dt_opencl_release_mem_object(tsums);
+  dt_opencl_release_mem_object(dev_shifts);
+  dt_opencl_release_mem_object(before);
+  dt_free_align(fit.blockwt);
+  dt_free_align(sums);
+  dt_free_align(shifts);
+  return err;
+}
+#endif
+
+void init_global(dt_iop_module_so_t *self)
+{
+  const int program = 49; // cacorrect.cl, from programs.conf
+  dt_iop_cacorrect_global_data_t *gd = malloc(sizeof(dt_iop_cacorrect_global_data_t));
+  self->data = gd;
+  gd->kernel_cacorrect_load = dt_opencl_create_kernel(program, "cacorrect_load");
+  gd->kernel_cacorrect_store = dt_opencl_create_kernel(program, "cacorrect_store");
+  gd->kernel_cacorrect_extend = dt_opencl_create_kernel(program, "cacorrect_extend");
+  gd->kernel_cacorrect_green = dt_opencl_create_kernel(program, "cacorrect_green");
+  gd->kernel_cacorrect_filters = dt_opencl_create_kernel(program, "cacorrect_filters");
+  gd->kernel_cacorrect_tile_sums = dt_opencl_create_kernel(program, "cacorrect_tile_sums");
+  gd->kernel_cacorrect_correct = dt_opencl_create_kernel(program, "cacorrect_correct");
+  gd->kernel_cacorrect_factors = dt_opencl_create_kernel(program, "cacorrect_factors");
+  gd->kernel_cacorrect_apply_factors = dt_opencl_create_kernel(program, "cacorrect_apply_factors");
+}
+
+void cleanup_global(dt_iop_module_so_t *self)
+{
+  dt_iop_cacorrect_global_data_t *gd = self->data;
+  if(gd)
+  {
+    dt_opencl_free_kernel(gd->kernel_cacorrect_load);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_store);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_extend);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_green);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_filters);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_tile_sums);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_correct);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_factors);
+    dt_opencl_free_kernel(gd->kernel_cacorrect_apply_factors);
+  }
+  free(self->data);
+  self->data = NULL;
+}
 
 /*==================================================================================
  * end raw therapee code
