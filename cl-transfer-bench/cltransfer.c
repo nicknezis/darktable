@@ -29,11 +29,21 @@ static const char *src =
   "{ const int x = get_global_id(0), y = get_global_id(1);\n"
   "  if(x >= w || y >= h) return;\n"
   "  float4 p = read_imagef(img, smp, (int2)(x, y));\n"
-  "  if(p.x == -12345.0f) out[0] = p.y; }\n";
+  "  if(p.x == -12345.0f) out[0] = p.y; }\n"
+  "__kernel void touchbuf(__constant float4 *in, __global float *out, int n)\n"
+  "{ const int i = get_global_id(0);\n"
+  "  if(i >= n) return;\n"
+  "  if(in[i].x == -12345.0f) out[0] = in[i].y; }\n"
+  "__kernel void touchgbuf(__global const float4 *in, __global float *out, int n)\n"
+  "{ const int i = get_global_id(0);\n"
+  "  if(i >= n) return;\n"
+  "  if(in[i].x == -12345.0f) out[0] = in[i].y; }\n";
 
 static cl_context ctx;
 static cl_command_queue q;
-static cl_kernel ktouch;
+static cl_kernel ktouch, ktouchbuf, ktouchgbuf;
+static cl_device_id device;
+static cl_ulong max_const;
 static cl_mem dummy;
 static const cl_image_format fmt = { CL_RGBA, CL_FLOAT };
 
@@ -57,6 +67,24 @@ static void touch(cl_mem img, int w, int h)
   CK(clFinish(q));
 }
 
+static void touchb(cl_kernel k, cl_mem b, size_t bytes)
+{
+  const int n = (int)(bytes / 16);
+  CK(clSetKernelArg(k, 0, sizeof(cl_mem), &b));
+  CK(clSetKernelArg(k, 1, sizeof(cl_mem), &dummy));
+  CK(clSetKernelArg(k, 2, sizeof(int), &n));
+  const size_t gws = (n + 63) / 64 * 64;
+  CK(clEnqueueNDRangeKernel(q, k, 1, NULL, &gws, NULL, 0, NULL, NULL));
+  CK(clFinish(q));
+}
+
+static void *alloc_page(size_t bytes)
+{
+  void *p = NULL;
+  if(posix_memalign(&p, 4096, (bytes + 4095) & ~(size_t)4095)) { fprintf(stderr, "posix_memalign failed\n"); exit(1); }
+  return p;
+}
+
 static int cmp(const void *a, const void *b)
 {
   const double x = *(const double *)a, y = *(const double *)b;
@@ -68,6 +96,14 @@ static void report(const char *name, double *t, int reps, size_t bytes, double s
   qsort(t, reps, sizeof(double), cmp);
   const double med = t[reps / 2] - sub;
   printf("  %-44s %8.1f ms  %6.2f GB/s\n", name, 1e3 * med, bytes / med / 1e9);
+}
+
+static void report_us(const char *name, double *t, int reps, size_t bytes, double sub)
+{
+  qsort(t, reps, sizeof(double), cmp);
+  const double med = t[reps / 2] - sub;
+  // small transfers sit near the kernel launch noise, so show the raw time too
+  printf("  %-44s %8.1f us  (raw %7.1f us)\n", name, 1e6 * med, 1e6 * t[reps / 2]);
 }
 
 static void bench(int w, int h, int reps)
@@ -173,6 +209,62 @@ static void bench(int w, int h, int reps)
   }
   report("up E: WriteBuffer pageable (buffer, not image)", t, reps, bytes, 0.0);
 
+  // B2: non-blocking WriteImage, kernel queued behind it, one clFinish
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    CK(clEnqueueWriteImage(q, res, CL_FALSE, origin, region, 0, 0, host, 0, NULL, NULL));
+    touch(res, w, h);
+    t[r] = now() - t0;
+  }
+  report("up B2: WriteImage non-blocking, image reused", t, reps, bytes, ktime);
+
+  // zero-copy candidates (Intel guide): host memory page aligned, row pitch a multiple of 64
+  const size_t zpitch = ((size_t)w * 16 + 63) & ~(size_t)63;
+  const size_t zbytes = zpitch * h;
+  float *zhost = alloc_page(zbytes);
+  for(int y = 0; y < h; y++) memcpy((char *)zhost + y * zpitch, (char *)host + (size_t)y * w * 16, (size_t)w * 16);
+
+  // A3: new image on the existing host memory, CL_MEM_USE_HOST_PTR
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateImage2D(ctx, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, &fmt, w, h, zpitch, zhost, &err);
+    CK(err);
+    touch(m, w, h);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report("up A3: CreateImage USE_HOST_PTR, aligned", t, reps, bytes, ktime);
+
+  // A4: new image with CL_MEM_ALLOC_HOST_PTR, map, memcpy, unmap
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = new_image(w, h, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, NULL);
+    size_t rp = 0;
+    char *p = clEnqueueMapImage(q, m, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, origin, region, &rp, NULL, 0, NULL, NULL, &err);
+    CK(err);
+    for(int y = 0; y < h; y++) memcpy(p + y * rp, (char *)host + (size_t)y * w * 16, (size_t)w * 16);
+    CK(clEnqueueUnmapMemObject(q, m, p, 0, NULL, NULL));
+    touch(m, w, h);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report("up A4: CreateImage ALLOC_HOST_PTR + map/memcpy", t, reps, bytes, ktime);
+  free(zhost);
+
+  // F2: ReadImage into freshly allocated, never touched host memory (#21069)
+  for(int r = 0; r < reps; r++)
+  {
+    float *cold = malloc(bytes);
+    double t0 = now();
+    CK(clEnqueueReadImage(q, res, CL_TRUE, origin, region, 0, 0, cold, 0, NULL, NULL));
+    t[r] = now() - t0;
+    free(cold);
+  }
+  report("down F2: ReadImage into cold host memory", t, reps, bytes, 0.0);
+
   // F: darktable readback path, blocking ReadImage into pageable host memory
   for(int r = 0; r < reps; r++)
   {
@@ -205,6 +297,107 @@ static void bench(int w, int h, int reps)
   free(back);
 }
 
+// small read-only buffers as uploaded by dt_opencl_copy_host_to_device_constant
+// (opencl.c), mostly LUTs and coefficients, created and released per process_cl
+static void small(size_t bytes, int reps)
+{
+  float *host = alloc_page(bytes);
+  for(size_t i = 0; i < bytes / sizeof(float); i++) host[i] = (float)(i & 1023) * 0.001f;
+  double t[1024];
+  cl_int err;
+  if(reps > 1024) reps = 1024;
+  // same split as dt: __constant only up to an eighth of the device limit
+  const int oversize = bytes > max_const / 8;
+  cl_kernel k = oversize ? ktouchgbuf : ktouchbuf;
+  printf("small buffer %zu KB (%s), median of %d\n", bytes / 1024, oversize ? "global" : "constant", reps);
+
+  cl_mem res = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, host, &err);
+  CK(err);
+  touchb(k, res, bytes);
+  for(int r = 0; r < reps; r++) { double t0 = now(); touchb(k, res, bytes); t[r] = now() - t0; }
+  qsort(t, reps, sizeof(double), cmp);
+  const double ktime = t[reps / 2];
+  printf("  %-44s %8.1f us\n", "touch kernel on resident buffer", 1e6 * ktime);
+  clReleaseMemObject(res);
+
+  // S1: dt path, CreateBuffer READ_ONLY | COPY_HOST_PTR
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, host, &err);
+    CK(err);
+    touchb(k, m, bytes);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report_us("S1: CreateBuffer COPY_HOST_PTR (dt path)", t, reps, bytes, ktime);
+
+  // S0: allocation only
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_ONLY, bytes, NULL, &err);
+    CK(err);
+    touchb(k, m, bytes);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report_us("S0: CreateBuffer, no copy", t, reps, bytes, ktime);
+
+  // S2: CreateBuffer then blocking WriteBuffer
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_ONLY, bytes, NULL, &err);
+    CK(err);
+    CK(clEnqueueWriteBuffer(q, m, CL_TRUE, 0, bytes, host, 0, NULL, NULL));
+    touchb(k, m, bytes);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report_us("S2: CreateBuffer + blocking WriteBuffer", t, reps, bytes, ktime);
+
+  // S3: CreateBuffer then non-blocking WriteBuffer, kernel queued behind it
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_ONLY, bytes, NULL, &err);
+    CK(err);
+    CK(clEnqueueWriteBuffer(q, m, CL_FALSE, 0, bytes, host, 0, NULL, NULL));
+    touchb(k, m, bytes);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report_us("S3: CreateBuffer + non-blocking WriteBuffer", t, reps, bytes, ktime);
+
+  // S4: zero-copy, USE_HOST_PTR on page-aligned memory (Intel guide)
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    cl_mem m = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR, bytes, host, &err);
+    CK(err);
+    touchb(k, m, bytes);
+    t[r] = now() - t0;
+    clReleaseMemObject(m);
+  }
+  report_us("S4: CreateBuffer USE_HOST_PTR, aligned", t, reps, bytes, ktime);
+
+  // S5: reused buffer, blocking WriteBuffer (what a per-pipe cache would cost)
+  cl_mem keep = clCreateBuffer(ctx, CL_MEM_READ_ONLY, bytes, NULL, &err);
+  CK(err);
+  for(int r = 0; r < reps; r++)
+  {
+    double t0 = now();
+    CK(clEnqueueWriteBuffer(q, keep, CL_TRUE, 0, bytes, host, 0, NULL, NULL));
+    touchb(k, keep, bytes);
+    t[r] = now() - t0;
+  }
+  report_us("S5: WriteBuffer into reused buffer", t, reps, bytes, ktime);
+  clReleaseMemObject(keep);
+
+  free(host);
+}
+
 int main(int argc, char **argv)
 {
   cl_platform_id plat[8];
@@ -233,7 +426,20 @@ int main(int argc, char **argv)
   CK(clGetDeviceIDs(plat[pi], CL_DEVICE_TYPE_ALL, 8, dev, &nd));
   char name[256];
   clGetDeviceInfo(dev[di], CL_DEVICE_NAME, sizeof(name), name, NULL);
-  printf("device: %s\n", name);
+  device = dev[di];
+  {
+    char vendor[256] = "", dver[256] = "", cver[256] = "";
+    cl_bool unified = CL_FALSE;
+    cl_ulong cmax = 0;
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+    clGetDeviceInfo(device, CL_DRIVER_VERSION, sizeof(dver), dver, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_VERSION, sizeof(cver), cver, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(unified), &unified, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE, sizeof(cmax), &cmax, NULL);
+    max_const = cmax;
+    printf("device: %s\nvendor: %s\ndriver: %s  (%s)\nhost unified memory: %s, max constant buffer %llu KB\n",
+           name, vendor, dver, cver, unified ? "yes" : "no", (unsigned long long)cmax / 1024);
+  }
   cl_int err;
   ctx = clCreateContext(NULL, 1, &dev[di], NULL, NULL, &err);
   CK(err);
@@ -244,9 +450,16 @@ int main(int argc, char **argv)
   CK(clBuildProgram(prog, 1, &dev[di], "", NULL, NULL));
   ktouch = clCreateKernel(prog, "touch", &err);
   CK(err);
+  ktouchbuf = clCreateKernel(prog, "touchbuf", &err);
+  CK(err);
+  ktouchgbuf = clCreateKernel(prog, "touchgbuf", &err);
+  CK(err);
   dummy = clCreateBuffer(ctx, CL_MEM_READ_WRITE, 16, NULL, &err);
   CK(err);
 
+  small(4 << 10, 200);
+  small(64 << 10, 200);
+  small(1 << 20, 100);
   bench(2913, 1859, reps);  // 100% view crop from the Intel Mac test
   bench(6192, 4128, reps);  // full FX30 frame, what demosaicscale used to upload
   return 0;
