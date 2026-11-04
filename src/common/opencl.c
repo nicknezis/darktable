@@ -529,7 +529,6 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   // setting sane/conservative defaults at first
   cl->dev[dev].unified_fraction = 0.25f;
   cl->dev[dev].unified_memory = FALSE;
-  cl->dev[dev].cpu_device = FALSE;
   cl->dev[dev].clroundup_wd = 16;
   cl->dev[dev].clroundup_ht = 16;
   cl->dev[dev].use_events = TRUE;
@@ -772,7 +771,6 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
   (cl->dlocl->symbols->dt_clGetDeviceInfo)(devid, CL_DEVICE_HOST_UNIFIED_MEMORY,
                                            sizeof(cl_bool), &unified_memory, NULL);
   cl->dev[dev].unified_memory = unified_memory ? TRUE : FALSE;
-  cl->dev[dev].cpu_device = (type & CL_DEVICE_TYPE_CPU) == CL_DEVICE_TYPE_CPU;
 
 #ifndef _opencl_apply_scheduling_profile  // they never supported inline assembling
   if(strstr(platform_display_name, "NVIDIA CUDA"))
@@ -797,6 +795,16 @@ static gboolean _opencl_device_init(dt_opencl_t *cl,
     dt_print_nts(DT_DEBUG_OPENCL,
                  "   *** discarding new custom device ***\n");
     cl->dev[dev].disabled |= TRUE;
+    res = TRUE;
+    goto end;
+  }
+
+  // PoCL is the only platform allowed to run OpenCL on the CPU: macOS'
+  // CPU device fails to allocate images and its exports came out wrong
+  if((type & CL_DEVICE_TYPE_CPU) && strcmp(pname, "portablecomputinglanguage"))
+  {
+    dt_print_nts(DT_DEBUG_OPENCL,
+                 "   *** discarding CPU device, only PoCL may run on the CPU ***\n");
     res = TRUE;
     goto end;
   }
@@ -1399,7 +1407,10 @@ void dt_opencl_init(dt_opencl_t *cl,
       platform_key[j] = 0;
 
       if(dt_conf_key_exists(platform_key))
-        valid_platform = dt_conf_get_bool(platform_key);
+        // PoCL used to be one of the other platforms, so that still enables it
+        valid_platform = dt_conf_get_bool(platform_key)
+          || (strcmp(platform_key, "clplatform_portablecomputinglanguage") == 0
+              && dt_conf_get_bool("clplatform_other"));
       /* In some cases it is safe to assume platform aliases instead of adding
           an additional conf key or falling back to clplatform_other
       */
@@ -1969,22 +1980,13 @@ static void _opencl_priority_parse(dt_opencl_t *cl,
 
     if(all)
     {
-      // copy all remaining device numbers from full to priority list.
-      // CPU devices are left out: macOS' one fails to allocate images and
-      // its exports came out wrong. They stay in full so that a later
-      // token, as in '*,1', can still choose them by number or name
-      int left = 0;
+      // copy all remaining device numbers from full to priority list
       for(int i = 0; i < devs && full[i] != -1; i++)
       {
-        if(cl->dev[full[i]].cpu_device)
-          full[left++] = full[i];
-        else
-        {
-          priority_list[count] = full[i];
-          count++;
-        }
+        priority_list[count] = full[i];
+        count++;
       }
-      full[left] = -1;
+      full[0] = -1; // mark full list as empty
     }
     else if(*str != '\0')
     {
@@ -3911,19 +3913,6 @@ gboolean dt_opencl_running_fast(void)
   return _cl_running() ? darktable.opencl->fastcl : FALSE;
 }
 
-// is the device in any pipe's priority list?
-static gboolean _opencl_device_scheduled(dt_opencl_t *cl,
-                                         const int devid)
-{
-  const int *lists[] = { cl->dev_priority_image, cl->dev_priority_preview,
-                         cl->dev_priority_preview2, cl->dev_priority_export,
-                         cl->dev_priority_thumbnail };
-  for(int l = 0; l < G_N_ELEMENTS(lists); l++)
-    for(const int *p = lists[l]; p && *p != -1; p++)
-      if(*p == devid) return TRUE;
-  return FALSE;
-}
-
 /** update enabled flag and profile with value from preferences */
 void dt_opencl_update_settings(void)
 {
@@ -3982,10 +3971,7 @@ void dt_opencl_update_settings(void)
     if(cl->dev[i].unified_memory)
     {
       cl->dev[i].used_available = MIN(cl->dev[i].used_available, res->total_memory * cl->dev[i].unified_fraction);
-      // a CPU device left out of every priority list never runs a pipe,
-      // so it must not withhold system memory from darktable
-      if(!cl->dev[i].cpu_device || _opencl_device_scheduled(cl, i))
-        res->cl_uni_memory += cl->dev[i].used_available;
+      res->cl_uni_memory += cl->dev[i].used_available;
     }
     dt_print_nts(DT_DEBUG_OPENCL,
          "   AVAILABLE MEM SIZE:       %zu MB%s\n",
