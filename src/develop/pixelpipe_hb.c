@@ -2347,7 +2347,13 @@ static gboolean _slang_possible(dt_dev_pixelpipe_t *pipe,
 {
   const int ch_in = input_format->channels;
   const int ch_out = out_format->channels;
+  // as on OpenCL: a 100% crop of a host-cached full demosaiced image is far
+  // cheaper on the host than uploading the whole image for it
+  const gboolean host_crop = roi_out->scale >= 1.0f
+    && !(pipe->slang_image && pipe->slang_host == input)
+    && dt_iop_module_is(module, "demosaicscale");
   return module->process_slang
+    && !host_crop
     && piece->process_cl_ready
     && pipe->slang_enabled
     && dt_slang_gpu_enabled()
@@ -3364,6 +3370,16 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
         && piece->process_cl_ready
         && !(dt_pipe_is_preview(pipe) && (module->flags() & IOP_FLAGS_PREVIEW_NON_OPENCL))
         && !_avoid_cl_module(piece);
+
+    /* At 100% zoom and above demosaicscale only cuts the visible window out of the
+       full demosaiced image. If that image comes from the host cache, the device
+       path would upload all of it for a crop, which costs far more than cropping
+       on the host and uploading the small result for the next module. */
+    if(possible_cl
+       && cl_mem_input == NULL
+       && roi_out->scale >= 1.0f
+       && dt_iop_module_is(module, "demosaicscale"))
+      possible_cl = FALSE;
 
     /* A colorspace conversion of the input is done before the module runs, into a second
        image that replaces the original, so one extra full-size buffer is live while it
