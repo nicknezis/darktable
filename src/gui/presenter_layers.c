@@ -162,6 +162,19 @@ static dt_presenter_window_t *_window_get(GtkWidget *widget)
 void dt_presenter_window_set_output(dt_presenter_window_t *window,
                                     const dt_display_output_t *output)
 {
+  dt_display_output_t stepped;
+  if(output)
+  {
+    // a new headroom reprocesses the window's pipes and redoes its
+    // thumbnails. it follows the screen's brightness: a compositor's
+    // slider, or macOS ramping EDR from 1 to 16 in a couple of hundred
+    // steps. steps of 1/8 EV, rounded down so that the image never asks
+    // for more than the screen has, leave a few changes of those
+    stepped = *output;
+    stepped.image.headroom =
+      exp2f(floorf(log2f(fmaxf(output->image.headroom, 1.0f)) * 8.0f) / 8.0f);
+    output = &stepped;
+  }
   if(dt_colorspaces_set_window_output(window->kind, output))
     dt_presenter_window_redraw(window);
 }

@@ -85,6 +85,11 @@ markers are written as they are, saturated colors that mark in any output.
   above or below the screen's, and the output encoding says so. The
   presenter clips what the screen cannot show: the Wayland transport to the
   range of its image description, cairo the encoded values to 8 bits.
+  When sigmoid and agx follow the output, the darkroom shows the edit for
+  the screen's current headroom, not for the export's PQ peak.
+  `dt_presenter_window_set_output()` rounds a backend's headroom down to
+  1/8 EV steps, since it follows the screen's brightness and every change
+  reprocesses the window's pipes.
 - `pipe->output_encoding` (`dt_color_encoding_t`) is what the pipe's output
   values are: the profile, intent and headroom of the transform colorout
   built, after it replaced a missing or unsupported profile by sRGB, or the
