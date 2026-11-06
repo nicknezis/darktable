@@ -909,13 +909,25 @@ dt_slang_gpu_image_t *dt_slang_gpu_image_new(const int width,
       const size_t row = sizeof(float) * channels * width;
       _copy_rows(img->buffer.contents, img->pitch, host, row, row, height);
     }
-    else if(!img && _mtl.private_storage)
-    {
-      img = _image_private(width, height, channels);
-      if(img && host && !_upload(img, nil, host, img->pitch * height)) img = nil;
-    }
     else if(!img)
-      img = _image_new(width, height, channels, host);
+    {
+      // Vulkan on a Radeon 780M spent 1.4 s of a 61 MP export allocating
+      // images the pool had no exact match for; this counts them on Metal.
+      // The pages are mapped when the GPU first touches them, so the time
+      // here is only a lower bound
+      const double start = dt_get_debug_wtime();
+      if(_mtl.private_storage)
+      {
+        img = _image_private(width, height, channels);
+        if(img && host && !_upload(img, nil, host, img->pitch * height)) img = nil;
+      }
+      else
+        img = _image_new(width, height, channels, host);
+      const size_t bytes = sizeof(float) * channels * width * height;
+      if(bytes >= (64 << 20))
+        dt_print(DT_DEBUG_PERF, "[slang_gpu] new %dx%d image of %zu MB, none pooled, took %.3f secs",
+                 width, height, bytes >> 20, dt_get_debug_wtime() - start);
+    }
   }
   g_mutex_unlock(&_mtl_lock);
   if(!img) dt_print(DT_DEBUG_SLANG, "[slang_gpu] can't allocate a %dx%d device image", width, height);
