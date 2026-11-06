@@ -325,6 +325,7 @@ typedef struct dt_dev_pixelpipe_t
   // sum of all per-piece detail/raster mask caches currently allocated in this pipe
   size_t mask_cache_size;
   gint64 started_time; // monotonic timestamp (in microseconds) when the pipe started
+  gint64 finished_time; // monotonic timestamp (in microseconds) of the last complete run
 } dt_dev_pixelpipe_t;
 
 struct dt_develop_t;

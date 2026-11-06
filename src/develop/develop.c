@@ -294,6 +294,11 @@ static inline gboolean _inside_pipe_ui_frame(const dt_dev_pixelpipe_t *pipe)
   return elapsed < pipe->average_delay/2;
 }
 
+static inline gboolean _full_frame_starved(const dt_dev_pixelpipe_t *pipe)
+{
+  return g_get_monotonic_time() - pipe->finished_time > pipe->average_delay;
+}
+
 void dt_dev_process_image(dt_develop_t *dev)
 {
   if(!dev->gui_attached) return;
@@ -887,6 +892,7 @@ restart:
   const gboolean early = dt_dev_pixelpipe_process(pipe, dev, x, y, wd, ht, scale, devid);
   const dt_dev_pixelpipe_stopper_t shutdown = dt_atomic_exch_int(&pipe->shutdown, DT_DEV_PIXELPIPE_STOP_NO);
   const gboolean stopped = early || shutdown > DT_DEV_PIXELPIPE_PROCESSING;
+  if(!stopped) pipe->finished_time = g_get_monotonic_time();
 
   const dt_iop_roi_t proi = (dt_iop_roi_t) {.x = x, .y = y, .width = wd, .height = ht, .scale = scale };
   dt_print_pipe(DT_DEBUG_PIPE, stopped ? "pixelpipe_process stopped" : "pixelpipe_process good",
@@ -3669,7 +3675,12 @@ static void _dev_zoom_move(dt_dev_viewport_t *port,
 
   if(port->widget)
   {
-    if(dt_pipe_processing(port->pipe) && port == &dev->full)
+    // while panning every mouse move lands here. Aborting on each one means a
+    // full pipe never completes during a drag and only the blurry preview is
+    // shown, so let a running pipe finish once no full frame has been shown
+    // for about one pipe run; the restart picks up the new position.
+    if(dt_pipe_processing(port->pipe) && port == &dev->full
+       && !_full_frame_starved(port->pipe))
       dt_dev_pixelpipe_set_shutdown(port->pipe, DT_DEV_PIXELPIPE_STOP_ZOOM);
     dt_control_queue_redraw_widget(port->widget);
   }
