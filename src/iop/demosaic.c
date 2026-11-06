@@ -316,6 +316,7 @@ void amaze_demosaic(const float *const in,
 #include "iop/demosaicing/capture.c"
 #include "iop/demosaicing/dual.c"
 #include "iop/demosaicing/amaze_slang.c"
+#include "iop/demosaicing/lmmse_slang.c"
 
 const char *name()
 {
@@ -1038,8 +1039,9 @@ int process_cl(dt_iop_module_t *self,
   dt_iop_demosaic_gui_data_t *g = self->gui_data;
   const dt_iop_demosaic_global_data_t *gd = self->global_data;
 
-  // commit_params() lets AMaZE through for its Slang path only
-  if(fullscale && (d->demosaicing_method & ~DT_DEMOSAIC_DUAL) == DT_IOP_DEMOSAIC_AMAZE)
+  // commit_params() lets AMaZE and LMMSE through for their Slang paths only
+  if(fullscale && ((d->demosaicing_method & ~DT_DEMOSAIC_DUAL) == DT_IOP_DEMOSAIC_AMAZE
+                   || d->demosaicing_method == DT_IOP_DEMOSAIC_LMMSE))
     return DT_OPENCL_PROCESS_CL;
 
   const int demosaicing_method = d->demosaicing_method;
@@ -1413,7 +1415,8 @@ gboolean process_slang(dt_iop_module_t *self,
   const gboolean supported =
     ((is_bayer
       && (method == DT_IOP_DEMOSAIC_RCD || method == DT_IOP_DEMOSAIC_VNG4
-          || method == DT_IOP_DEMOSAIC_PPG || method == DT_IOP_DEMOSAIC_AMAZE || passthru))
+          || method == DT_IOP_DEMOSAIC_PPG || method == DT_IOP_DEMOSAIC_AMAZE
+          || method == DT_IOP_DEMOSAIC_LMMSE || passthru))
      || (is_xtrans
          && (method == DT_IOP_DEMOSAIC_VNG || method == DT_IOP_DEMOSAIC_MARKESTEIJN
              || method == DT_IOP_DEMOSAIC_MARKESTEIJN_3 || passthru)))
@@ -1503,6 +1506,9 @@ gboolean process_slang(dt_iop_module_t *self,
         break;
       case DT_IOP_DEMOSAIC_AMAZE:
         ok = process_amaze_slang(piece, in_image, high, iwidth, iheight, filters);
+        break;
+      case DT_IOP_DEMOSAIC_LMMSE:
+        ok = process_lmmse_slang(piece, in_image, high, iwidth, iheight, filters, d->lmmse_refine);
         break;
       case DT_IOP_DEMOSAIC_PASSTHROUGH_MONOCHROME:
         ok = !dt_slang_gpu_run_2d_args("demosaic_other", "passthrough_monochrome", iwidth, iheight,
@@ -1765,7 +1771,7 @@ void commit_params(dt_iop_module_t *self,
 
   d->demosaicing_method = use_method;
 
-  // AMaZE has no OpenCL implementation, but a Slang one, which
+  // AMaZE and LMMSE have no OpenCL implementation, but a Slang one, which
   // process_cl_ready also gates; process_cl() hands it to the CPU. The
   // pipe sets slang_enabled only when it starts processing, after this
   gboolean on_slang = FALSE;
@@ -1780,7 +1786,7 @@ void commit_params(dt_iop_module_t *self,
       piece->process_cl_ready = on_slang;
       break;
     case DT_IOP_DEMOSAIC_LMMSE:
-      piece->process_cl_ready = FALSE;
+      piece->process_cl_ready = on_slang;
       break;
     case DT_IOP_DEMOSAIC_AMAZE_DUAL:
       piece->process_cl_ready = on_slang;
