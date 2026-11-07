@@ -802,10 +802,12 @@ static inline void _apply_tone_curves(dt_aligned_pixel_t pixel,
   }
 }
 
-// sample xform on a CLUT_LEVEL^3 grid over RGB input values 0..1, the first
-// channel varying fastest as in the lut3d module. The grid is linear: the
-// LittleCMS transforms that get here (LUT input profiles) take scene-linear
-// camera values and clip them to 0..1 themselves.
+// sample xform (camera RGB to Lab) on a CLUT_LEVEL^3 grid over RGB input
+// values 0..1, the first channel varying fastest as in the lut3d module. The
+// grid is linear: the LittleCMS transforms that get here (LUT input profiles)
+// take scene-linear camera values and clip them to 0..1 themselves. The nodes
+// hold XYZ, not Lab: the cube root in Lab interpolates badly on a linear grid
+// near black (dE > 2 on dark pixels), so colorin_clut does XYZ to Lab per pixel.
 static float *_bake_clut(cmsHTRANSFORM xform)
 {
   const size_t level = CLUT_LEVEL;
@@ -838,7 +840,11 @@ static float *_bake_clut(cmsHTRANSFORM xform)
 
   DT_OMP_FOR()
   for(size_t k = 0; k < nodes; k++)
-    for(int c = 0; c < 3; c++) clut[3 * k + c] = out[4 * k + c];
+  {
+    dt_aligned_pixel_t XYZ;
+    dt_Lab_to_XYZ(out + 4 * k, XYZ);
+    for(int c = 0; c < 3; c++) clut[3 * k + c] = XYZ[c];
+  }
 
   dt_free_align(rgb);
   dt_free_align(out);

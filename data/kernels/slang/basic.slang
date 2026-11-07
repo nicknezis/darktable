@@ -333,7 +333,7 @@ void colorin_clut(uint3 gid : SV_DispatchThreadID,
 
   const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
   const float4 raw = in.readpixel(x, y);
-  float4 pixel = dt_lut3d_tetrahedral(clip4(corval * raw), clut, level);
+  float4 pixel = XYZ_to_Lab(dt_lut3d_tetrahedral(clip4(corval * raw), clut, level));
   pixel.w = raw.w;
   out.write(int2(x, y), pixel);
 }

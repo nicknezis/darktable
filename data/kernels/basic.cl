@@ -1466,7 +1466,7 @@ colorin_clut(read_only image2d_t in, write_only image2d_t out, const int width, 
 
   const float4 corval = (const float4)(corr[0], corr[1], corr[2], corr[3]);
   const float4 raw = readpixel(in, x, y);
-  float4 pixel = dt_lut3d_tetrahedral(clip4(corval * raw), clut, level);
+  float4 pixel = XYZ_to_Lab(dt_lut3d_tetrahedral(clip4(corval * raw), clut, level));
   pixel.w = raw.w;
   write_imagef(out, (int2)(x, y), pixel);
 }
