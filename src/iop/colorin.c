@@ -63,6 +63,8 @@
 #define DT_IOP_COLOR_ICC_LEN 512
 
 #define LUT_SAMPLES 0x10000
+// grid of the LittleCMS transform baked for the GPU, see _bake_clut()
+#define CLUT_LEVEL 65
 
 DT_MODULE_INTROSPECTION(7, dt_iop_colorin_params_t)
 
@@ -100,6 +102,7 @@ typedef struct dt_iop_colorin_global_data_t
 {
   int kernel_colorin_unbound;
   int kernel_colorin_clipping;
+  int kernel_colorin_clut;
 } dt_iop_colorin_global_data_t;
 
 typedef struct dt_iop_colorin_data_t
@@ -110,6 +113,7 @@ typedef struct dt_iop_colorin_data_t
   cmsHTRANSFORM *xform_cam_Lab;
   cmsHTRANSFORM *xform_cam_nrgb;
   cmsHTRANSFORM *xform_nrgb_Lab;
+  float *clut; // xform_cam_Lab baked into a CLUT_LEVEL^3 LUT for the GPU, built on first use
   float lut[3][LUT_SAMPLES];
   dt_colormatrix_t cmatrix;
   dt_colormatrix_t nmatrix;
@@ -635,6 +639,7 @@ void init_global(dt_iop_module_so_t *self)
   self->data = gd;
   gd->kernel_colorin_unbound = dt_opencl_create_kernel(program, "colorin_unbound");
   gd->kernel_colorin_clipping = dt_opencl_create_kernel(program, "colorin_clipping");
+  gd->kernel_colorin_clut = dt_opencl_create_kernel(program, "colorin_clut");
 }
 
 void cleanup_global(dt_iop_module_so_t *self)
@@ -642,6 +647,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   dt_iop_colorin_global_data_t *gd = self->data;
   dt_opencl_free_kernel(gd->kernel_colorin_unbound);
   dt_opencl_free_kernel(gd->kernel_colorin_clipping);
+  dt_opencl_free_kernel(gd->kernel_colorin_clut);
   free(self->data);
   self->data = NULL;
 }
@@ -796,6 +802,49 @@ static inline void _apply_tone_curves(dt_aligned_pixel_t pixel,
   }
 }
 
+// sample xform on a CLUT_LEVEL^3 grid over RGB input values 0..1, the first
+// channel varying fastest as in the lut3d module. The grid is linear: the
+// LittleCMS transforms that get here (LUT input profiles) take scene-linear
+// camera values and clip them to 0..1 themselves.
+static float *_bake_clut(cmsHTRANSFORM xform)
+{
+  const size_t level = CLUT_LEVEL;
+  const size_t nodes = level * level * level;
+  float *const rgb = dt_alloc_align_float(4 * nodes);
+  float *const out = dt_alloc_align_float(4 * nodes);
+  float *const clut = dt_alloc_align_float(3 * nodes);
+  if(!rgb || !out || !clut)
+  {
+    dt_free_align(rgb);
+    dt_free_align(out);
+    dt_free_align(clut);
+    return NULL;
+  }
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < nodes; k++)
+  {
+    rgb[4 * k + 0] = (float)(k % level) / (float)(level - 1);
+    rgb[4 * k + 1] = (float)((k / level) % level) / (float)(level - 1);
+    rgb[4 * k + 2] = (float)(k / (level * level)) / (float)(level - 1);
+    rgb[4 * k + 3] = 0.0f;
+  }
+
+  const size_t chunksize = dt_cacheline_chunks(nodes, dt_get_num_threads());
+  DT_OMP_FOR()
+  for(size_t chunkstart = 0; chunkstart < nodes; chunkstart += chunksize)
+    cmsDoTransform(xform, rgb + 4 * chunkstart, out + 4 * chunkstart,
+                   MIN(chunkstart + chunksize, nodes) - chunkstart);
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < nodes; k++)
+    for(int c = 0; c < 3; c++) clut[3 * k + c] = out[4 * k + c];
+
+  dt_free_align(rgb);
+  dt_free_align(out);
+  return clut;
+}
+
 #ifdef HAVE_OPENCL
 int process_cl(dt_iop_module_t *self,
                dt_dev_pixelpipe_iop_t *piece,
@@ -837,6 +886,26 @@ int process_cl(dt_iop_module_t *self,
       pipe->dsc.temperature.coeffs[0], coeffs[0],
       pipe->dsc.temperature.coeffs[1], coeffs[1],
       pipe->dsc.temperature.coeffs[2], coeffs[2]);
+  }
+
+  // the LittleCMS path as a 3D LUT, as commit_params() allowed it
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  {
+    if(!d->clut) d->clut = _bake_clut(d->xform_cam_Lab);
+    if(!d->clut) return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+
+    const int level = CLUT_LEVEL;
+    cl_int err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    cl_mem dev_clut = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 3 * level * level * level,
+                                                             d->clut);
+    cl_mem dev_corr = dt_opencl_copy_host_to_device_constant(devid, sizeof(float) * 4, coeffs);
+    if(dev_clut && dev_corr)
+      err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_colorin_clut, width, height,
+                                             CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height),
+                                             CLARG(dev_clut), CLARG(level), CLARG(dev_corr));
+    dt_opencl_release_mem_object(dev_clut);
+    dt_opencl_release_mem_object(dev_corr);
+    return err;
   }
 
   cl_mem dev_m = NULL, dev_l = NULL, dev_r = NULL;
@@ -911,6 +980,24 @@ error:
 #endif
 
 #ifdef HAVE_SLANG_GPU
+// the LittleCMS path as a 3D LUT, as process_cl(). Returns non-zero on failure.
+static int _process_slang_clut(dt_iop_colorin_data_t *d,
+                               dt_slang_gpu_image_t *dev_in,
+                               dt_slang_gpu_image_t *dev_out,
+                               const int width,
+                               const int height,
+                               const dt_aligned_pixel_t coeffs)
+{
+  if(!d->clut) d->clut = _bake_clut(d->xform_cam_Lab);
+  if(!d->clut) return 1;
+
+  const int level = CLUT_LEVEL;
+  return dt_slang_gpu_run_2d_args("basic", "colorin_clut", width, height,
+    SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+    SLBUF(d->clut, sizeof(float) * 3 * level * level * level), SLARG(level),
+    SLBUF(coeffs, sizeof(float) * 4));
+}
+
 gboolean process_slang(dt_iop_module_t *self,
                        dt_dev_pixelpipe_iop_t *piece,
                        dt_slang_gpu_image_t *dev_in,
@@ -918,7 +1005,7 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_colorin_data_t *d = piece->data;
+  dt_iop_colorin_data_t *d = piece->data;
   dt_dev_pixelpipe_t *pipe = piece->pipe;
   const int width = roi_in->width;
   const int height = roi_in->height;
@@ -948,7 +1035,9 @@ gboolean process_slang(dt_iop_module_t *self,
   float dummy_hsm = 0.0f;
   const size_t len = use_hsm ? (size_t)d->hue_div * d->sat_div * d->val_div * 3 : 1;
 
-  const int err = dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
+  const int err = !dt_is_valid_colormatrix(d->cmatrix[0][0])
+    ? _process_slang_clut(d, dev_in, dev_out, width, height, coeffs)
+    : dt_slang_gpu_run_2d_args("basic", d->nrgb ? "colorin_clipping" : "colorin_unbound",
     width, height, SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
     SLBUF(cmat, sizeof(cmat)), SLBUF(lmat, sizeof(lmat)),
     SLIMG_IN(d->lut[0], 256, 256, 1), SLIMG_IN(d->lut[1], 256, 256, 1), SLIMG_IN(d->lut[2], 256, 256, 1),
@@ -1551,6 +1640,8 @@ void commit_params(dt_iop_module_t *self,
     cmsDeleteTransform(d->xform_nrgb_Lab);
     d->xform_nrgb_Lab = NULL;
   }
+  dt_free_align(d->clut);
+  d->clut = NULL;
 
   dt_mark_colormatrix_invalid(&d->cmatrix[0][0]);
   dt_mark_colormatrix_invalid(&d->nmatrix[0][0]);
@@ -1843,6 +1934,13 @@ void commit_params(dt_iop_module_t *self,
 
   d->nonlinearlut |= d->hdr_transfer != DT_HDR_NONE;
 
+  // the GPU runs xform_cam_Lab as a 3D LUT over RGB input. It has none of
+  // the gamut clipping, blue mapping or HDR decoding process_lcms2_proper()
+  // and process_lcms2_bm() wrap around the transform, so those stay on the CPU.
+  if(d->xform_cam_Lab && !d->nrgb && !d->blue_mapping && !d->hdr_transfer && !d->hsm
+     && input_format == TYPE_RGBA_FLT)
+    piece->process_cl_ready = TRUE;
+
   // commit color profiles to pipeline
   dt_ioppr_set_pipe_work_profile_info(self->dev, piece->pipe, d->type_work,
                                       d->filename_work, DT_INTENT_PERCEPTUAL);
@@ -1861,6 +1959,7 @@ void init_pipe(dt_iop_module_t *self,
   d->xform_cam_Lab = NULL;
   d->xform_cam_nrgb = NULL;
   d->xform_nrgb_Lab = NULL;
+  d->clut = NULL;
   d->hsm = NULL;
 }
 
@@ -1887,6 +1986,7 @@ void cleanup_pipe(dt_iop_module_t *self,
   }
 
   g_free(d->hsm);
+  dt_free_align(d->clut);
   free(piece->data);
   piece->data = NULL;
 }
