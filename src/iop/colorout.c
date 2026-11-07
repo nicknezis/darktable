@@ -320,7 +320,7 @@ static float _lerp_lut(const float *const lut, const float v)
   return l1 * (1.0f - f) + l2 * f;
 }
 
-#ifdef HAVE_OPENCL
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 // sample xform on a CLUT_LEVEL^3 grid over the Lab range LittleCMS encodes
 // floats in (L 0..100, a and b -128..127), the first channel varying fastest
 // as in the lut3d module. With gamut_marker, store 1 in all channels of a
@@ -474,7 +474,7 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_colorout_data_t *d = piece->data;
+  dt_iop_colorout_data_t *d = piece->data;
   const int width = roi_in->width;
   const int height = roi_in->height;
 
@@ -486,6 +486,24 @@ gboolean process_slang(dt_iop_module_t *self,
       SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height), SLARG(width), SLARG(height),
       SLARG(zero), SLARG(zero));
   }
+
+  // the LittleCMS path as a 3D LUT, as _process_cl_clut()
+  if(!dt_is_valid_colormatrix(d->cmatrix[0][0]))
+  {
+    const int gamutcheck = d->xform_nogamut != NULL;
+    if(!d->clut) d->clut = _bake_clut(gamutcheck ? d->xform_nogamut : d->xform, FALSE);
+    if(gamutcheck && !d->clut_gamut) d->clut_gamut = _bake_clut(d->xform, TRUE);
+    if(!d->clut || (gamutcheck && !d->clut_gamut)) return FALSE;
+
+    const int level = CLUT_LEVEL;
+    const size_t size = sizeof(float) * 3 * level * level * level;
+    // without gamut check the kernel never reads the marker LUT
+    return !dt_slang_gpu_run_2d_args("basic", "colorout_clut", width, height,
+      SLIMG_DEV(dev_in), SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
+      SLBUF(d->clut, size), SLARG(level), SLARG(gamutcheck),
+      SLBUF(gamutcheck ? d->clut_gamut : d->clut, size), SLARG(d->hdr_transfer));
+  }
+
   float cmatrix[9];
   pack_3xSSE_to_3x3(d->cmatrix, cmatrix);
 
