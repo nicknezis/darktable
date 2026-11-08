@@ -984,6 +984,15 @@ int dt_masks_group_render_roi(dt_iop_module_t *module,
                               float *buffer,
                               gboolean *pixels_missing);
 
+/** while a group folds a shape into its mask, it may ask the shape to draw
+    only part of the frame (see _group_get_mask_roi_flexi). A circle,
+    ellipse, path, brush or gradient asked then neither clears nor relies on
+    a cleared buffer: it writes every pixel of a rectangle, zeros included,
+    nothing outside it, and reports the rectangle, half open, before
+    returning 1 */
+gboolean dt_masks_extent_requested(void);
+void dt_masks_extent_report(const int x0, const int y0, const int x1, const int y1);
+
 // returns current masks version
 int dt_masks_version(void);
 
