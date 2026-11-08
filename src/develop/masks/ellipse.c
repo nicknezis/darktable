@@ -1914,7 +1914,10 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   // of bounding box is 2 or greater the shape lies inside of roi and
   // requires action
   if(bbw <= 1 || bbh <= 1)
+  {
+    if(dt_masks_extent_requested()) dt_masks_extent_report(0, 0, 0, 0);
     return 1;
+  }
 
   float *points = dt_alloc_align_float((size_t)2 * bbw * bbh);
   if(points == NULL) return 0;
@@ -1979,6 +1982,8 @@ static int _ellipse_get_mask_roi(const dt_iop_module_t *const module,
   }
 
   dt_free_align(points);
+  // the fill above wrote every pixel of this rectangle
+  if(dt_masks_extent_requested()) dt_masks_extent_report(bbxm * grid, bbym * grid, endx, endy);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] ellipse fill took %0.04f sec",

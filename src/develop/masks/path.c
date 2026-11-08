@@ -5354,7 +5354,8 @@ static void _path_falloff_roi(float *buffer,
 }
 
 // build a stamp which can be combined with other shapes in the same group
-// prerequisite: 'buffer' is all zeros
+// prerequisite: 'buffer' is all zeros, unless a group asked for the
+// extent (dt_masks_extent_requested)
 static int _path_get_mask_roi(const dt_iop_module_t *const module,
                               const dt_dev_pixelpipe_iop_t *const piece,
                               dt_masks_form_t *const form,
@@ -5376,6 +5377,7 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
   // 2) path is outside of roi, feather reaches into roi
   // 3) roi lies completely within path
   // 4) all other situations :)
+  const gboolean extent = dt_masks_extent_requested();
   int path_in_roi = 0;
   int feather_in_roi = 0;
   int path_encircles_roi = 0;
@@ -5486,6 +5488,7 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
   {
     dt_free_align(points);
     dt_free_align(border);
+    if(extent) dt_masks_extent_report(0, 0, 0, 0);
     return 1;
   }
 
@@ -5497,6 +5500,20 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] path_fill min max took %0.04f sec", form->name,
            dt_get_lap_time(&start2));
+
+  if(extent)
+  {
+    // what the fills below write: the path and its feather, plus the pixel
+    // either side that the falloff adds against rounding gaps
+    const int x0 = CLAMP(floorf(xmin) - 3.0f, 0.0f, (float)width);
+    const int y0 = CLAMP(floorf(ymin) - 3.0f, 0.0f, (float)height);
+    const int x1 = CLAMP(ceilf(xmax) + 4.0f, (float)x0, (float)width);
+    const int y1 = CLAMP(ceilf(ymax) + 4.0f, (float)y0, (float)height);
+    DT_OMP_FOR()
+    for(int y = y0; y < y1; y++)
+      memset(buffer + (size_t)y * width + x0, 0, sizeof(float) * (x1 - x0));
+    dt_masks_extent_report(x0, y0, x1, y1);
+  }
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] path_fill clear mask took %0.04f sec", form->name,
@@ -5537,6 +5554,7 @@ static int _path_get_mask_roi(const dt_iop_module_t *const module,
       // roi lies completely within path
       for(size_t k = 0; k < (size_t)width * height; k++)
         buffer[k] = 1.0f;
+      if(extent) dt_masks_extent_report(0, 0, width, height);
     }
     else
     {
