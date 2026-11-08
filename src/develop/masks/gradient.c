@@ -1236,7 +1236,8 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
                                   const dt_dev_pixelpipe_iop_t *const piece,
                                   dt_masks_form_t *const form,
                                   const dt_iop_roi_t *roi,
-                                  float *buffer)
+                                  float *buffer,
+                                  dt_masks_extent_t *const extent)
 {
   double start2 = dt_get_debug_wtime();
 
@@ -1371,7 +1372,7 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
 
   dt_free_align(points);
   // the fill above wrote the whole frame, so a group need not clear it first
-  if(dt_masks_extent_requested()) dt_masks_extent_report(0, 0, w, h);
+  if(extent) *extent = (dt_masks_extent_t){ 0, 0, w, h };
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] gradient fill took %0.04f sec", form->name,

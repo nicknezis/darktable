@@ -790,30 +790,8 @@ void dt_masks_combine_exclusion(float *const restrict dest,
 // pipes render on threads of their own
 static __thread gboolean _pixels_missing = FALSE;
 
-// the rectangle a shape drew while a flexi fold asked it for one, see
-// dt_masks_extent_requested(). per thread, as _pixels_missing
-static __thread struct
-{
-  gboolean requested, reported;
-  int x0, y0, x1, y1;
-} _extent;
-
-gboolean dt_masks_extent_requested(void)
-{
-  return _extent.requested;
-}
-
-void dt_masks_extent_report(const int x0, const int y0, const int x1, const int y1)
-{
-  _extent.reported = TRUE;
-  _extent.x0 = x0;
-  _extent.y0 = y0;
-  _extent.x1 = x1;
-  _extent.y1 = y1;
-}
-
-// the shapes that report what they draw. A member group seeds its whole
-// buffer, and the other forms draw on a cleared one
+// the shapes that take an extent (get_mask_roi in masks.h). A member group
+// seeds its whole buffer, and the other forms draw on a cleared one
 static gboolean _draws_extent(const dt_masks_form_t *const form)
 {
   return (form->type & (DT_MASKS_CIRCLE | DT_MASKS_ELLIPSE | DT_MASKS_PATH | DT_MASKS_BRUSH
@@ -1107,20 +1085,20 @@ static int _group_get_mask_roi_flexi(const dt_iop_module_t *const restrict modul
       fold = _EXTENT_PRODUCT;
     else if(screen || flexi_sum || flexi_exclusion)
       fold = _EXTENT_NONE;
-    _extent.requested = fold != _EXTENT_NONE && _draws_extent(sel) && !elem_refine
-                        && !(m->state & DT_MASKS_STATE_INVERSE);
-    _extent.reported = FALSE;
+    const gboolean use_extent = fold != _EXTENT_NONE && _draws_extent(sel) && !elem_refine
+                                && !(m->state & DT_MASKS_STATE_INVERSE);
+    // x1 < x0 until the shape sets it
+    dt_masks_extent_t extent = { 0, 0, -1, -1 };
 
     // a shape draws only its own area, onto zeros. A member group seeds its
     // whole buffer itself, and a full-size clear costs as much as a shape
-    if(!(sel->type & DT_MASKS_GROUP) && !_extent.requested)
+    if(!(sel->type & DT_MASKS_GROUP) && !use_extent)
       dt_iop_image_fill(dest, 0.0f, width, height, 1);
     _pixels_missing = FALSE;
-    const int rendered = dt_masks_get_mask_roi(module, piece, sel, roi, dest);
-    const gboolean extent = _extent.requested && _extent.reported;
-    if(_extent.requested && rendered && !extent)
-      dt_print(DT_DEBUG_ALWAYS, "[masks] %s drew without reporting its extent", sel->name);
-    _extent.requested = FALSE;
+    const int rendered =
+      dt_masks_get_mask_roi(module, piece, sel, roi, dest, use_extent ? &extent : NULL);
+    if(use_extent && rendered && extent.x1 < extent.x0)
+      dt_print(DT_DEBUG_ALWAYS, "[masks] %s drew without setting its extent", sel->name);
     if(!rendered)
     {
       // a member left out in place leaves `buffer` to the next member, which
@@ -1151,11 +1129,11 @@ static int _group_get_mask_roi_flexi(const dt_iop_module_t *const restrict modul
     // (blend.c). The panel badges its row
     const int inverted = (m->state & DT_MASKS_STATE_INVERSE)
                          && !dt_masks_raster_is_unresolved(module, piece, sel);
-    if(extent)
+    if(use_extent)
       _fold_extent(buffer, dest, width, height, op, fold,
-                   CLAMP(_extent.x0, 0, width), CLAMP(_extent.y0, 0, height),
-                   CLAMP(MAX(_extent.x0, _extent.x1), 0, width),
-                   CLAMP(MAX(_extent.y0, _extent.y1), 0, height));
+                   CLAMP(extent.x0, 0, width), CLAMP(extent.y0, 0, height),
+                   CLAMP(MAX(extent.x0, extent.x1), 0, width),
+                   CLAMP(MAX(extent.y0, extent.y1), 0, height));
     else if(in_place)
       _fold_first_maximum(buffer, npixels, op, inverted);
     else if(flexi_minimum)
@@ -1264,7 +1242,7 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
       // ensure that we start with a zeroed buffer regardless of what
       // was previously written into 'bufs'
       memset(bufs, 0, npixels*sizeof(float));
-      const int ok = dt_masks_get_mask_roi(module, piece, sel, roi, bufs);
+      const int ok = dt_masks_get_mask_roi(module, piece, sel, roi, bufs, NULL);
       const float op = fpt->opacity;
       const int state = fpt->state;
 
@@ -1380,7 +1358,7 @@ int dt_masks_group_render_roi(dt_iop_module_t *module,
 
   double start = dt_get_debug_wtime();
   _pixels_missing = FALSE;
-  const int ok = dt_masks_get_mask_roi(module, piece, form, roi, buffer);
+  const int ok = dt_masks_get_mask_roi(module, piece, form, roi, buffer, NULL);
   if(pixels_missing) *pixels_missing = !ok && _pixels_missing;
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
@@ -1464,7 +1442,8 @@ static int _group_get_mask_roi_guarded(const dt_iop_module_t *const restrict mod
                                        const dt_dev_pixelpipe_iop_t *const restrict piece,
                                        dt_masks_form_t *const form,
                                        const dt_iop_roi_t *const roi,
-                                       float *const restrict buffer)
+                                       float *const restrict buffer,
+                                       dt_masks_extent_t *const extent)
 {
   if(_render_depth > DT_MASKS_NESTING_MAX) return 0;
   _render_depth++;

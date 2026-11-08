@@ -1152,7 +1152,8 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
                                 const dt_dev_pixelpipe_iop_t *const restrict piece,
                                 dt_masks_form_t *const form,
                                 const dt_iop_roi_t *const roi,
-                                float *const restrict buffer)
+                                float *const restrict buffer,
+                                dt_masks_extent_t *const extent)
 {
   double start1 = dt_get_debug_wtime();
   double start2 = start1;
@@ -1182,7 +1183,6 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   const int gh = (h + grid - 1) / grid + 1;  // grid dimension of total roi
 
   // initialize output buffer with zero, unless a group folds only what we draw
-  const gboolean extent = dt_masks_extent_requested();
   if(!extent) memset(buffer, 0, sizeof(float) * w * h);
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
@@ -1281,7 +1281,7 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   // requires action
   if(bbw <= 1 || bbh <= 1)
   {
-    if(extent) dt_masks_extent_report(0, 0, 0, 0);
+    if(extent) *extent = (dt_masks_extent_t){ 0, 0, 0, 0 };
     return 1;
   }
 
@@ -1360,7 +1360,7 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   }
 
   dt_free_align(points);
-  if(extent) dt_masks_extent_report(bbxm * grid, bbym * grid, endx, endy);
+  if(extent) *extent = (dt_masks_extent_t){ bbxm * grid, bbym * grid, endx, endy };
 
   dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
            "[masks %s] circle fill took %0.04f sec",
