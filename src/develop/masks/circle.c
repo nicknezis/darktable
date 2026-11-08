@@ -1340,6 +1340,12 @@ static int _circle_get_mask_roi(const dt_iop_module_t *const restrict module,
   // we only need to take the contents of our bounding box into account
   const int endx = MIN(w, bbXM * grid);
   const int endy = MIN(h, bbYM * grid);
+  if(extent && extent->grid)
+  {
+    *extent->grid = (dt_masks_grid_t){ points, bbw, bbh, grid, bbxm, bbym };
+    *extent = (dt_masks_extent_t){ bbxm * grid, bbym * grid, endx, endy, extent->grid };
+    return 1;
+  }
   DT_OMP_FOR()
   for(int j = bbym * grid; j < endy; j++)
   {

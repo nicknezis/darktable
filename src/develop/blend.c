@@ -2617,6 +2617,33 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
       dt_masks_get_from_id_ext(piece->pipe->forms, dt_develop_blend_mask_group_id(self, d));
 
     if(form && (form->points || !(mask_mode & DEVELOP_MASK_FLEXI)) && mode_drawn
+       && dt_blend_may_render_group(self, mask_mode) && dt_masks_group_slang_supported(piece, form))
+    {
+      // the shapes' outlines and grid values come from the host, the fill
+      // and the fold run here. A full-frame mask never crosses the bus, which
+      // is what a discrete GPU pays for most. Not cached: a cache hit would
+      // upload the whole frame, as costly as rendering it
+      what = "form on device";
+      dev_mask_2 = dt_masks_group_render_roi_slang(self, piece, form, roi_out, &form_ok);
+      if(!dev_mask_2) goto error;
+      if(inverted)
+      {
+        dt_slang_gpu_image_t *inv = dt_slang_gpu_image_new(owidth, oheight, 1, NULL);
+        const int invert = 1;
+        const float gain = 1.0f;
+        if(!inv
+           || dt_slang_gpu_run_2d_args("blendop", "mask_invert_scale", owidth, oheight,
+                SLIMG_DEV(dev_mask_2), SLIMG_DEV(inv), SLARG(owidth), SLARG(oheight), SLARG(invert),
+                SLARG(gain)))
+        {
+          dt_slang_gpu_image_free(inv);
+          goto error;
+        }
+        dt_slang_gpu_image_free(dev_mask_2);
+        dev_mask_2 = inv;
+      }
+    }
+    else if(form && (form->points || !(mask_mode & DEVELOP_MASK_FLEXI)) && mode_drawn
        && dt_blend_may_render_group(self, mask_mode))
     {
       what = "form";
@@ -2683,7 +2710,9 @@ gboolean dt_develop_blend_process_slang(dt_iop_module_t *self,
     }
     else
     {
-      if(mask)
+      if(dev_mask_2)
+        ; // rendered on the device
+      else if(mask)
       {
         dev_mask_2 = dt_slang_gpu_image_new(owidth, oheight, 1, mask);
         if(!dev_mask_2) goto error;

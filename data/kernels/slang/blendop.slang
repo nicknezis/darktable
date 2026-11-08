@@ -1262,6 +1262,88 @@ void blendop_fill_mask(uint3 gid : SV_DispatchThreadID,
   mask.write(int2(x, y), float4(value));
 }
 
+// the drawn mask fold of a flexi group on the device, as
+// _group_get_mask_roi_flexi() and _fold_extent() in src/develop/masks/group.c
+// with the same expressions. kind: 0 the first member of a maximum or a
+// difference, 1 maximum, 2 difference, 3 minimum, 4 product
+float _mask_fold(const float d, const float v, const int kind, const float opacity)
+{
+  const float mask = opacity * v;
+  if(kind == 0) return max(0.0f, mask);
+  if(kind == 1) return max(d, mask);
+  if(kind == 2) return d * (1.0f - mask * float(d > 0.0f && mask > 0.0f));
+  if(kind == 3) return min(max(d, 0.0f), max(mask, 0.0f));
+  return d * mask;
+}
+
+// a member a circle, ellipse or gradient fills, interpolated from its values
+// on the grid (every second float) as the shapes fill on the host, inside
+// rect (x0, y0, x1, y1) and 0 outside it
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void mask_fold_grid(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn acc, uniform StructuredBuffer<float> points, uniform ImageOut out,
+                    uniform int width, uniform int height, uniform int kind, uniform float opacity,
+                    uniform int grid, uniform int stride, uniform int gx0, uniform int gy0,
+                    uniform int4 rect)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  float v = 0.0f;
+  if(x >= rect.x && x < rect.z && y >= rect.y && y < rect.w)
+  {
+    const int ii = x % grid;
+    const int jj = y % grid;
+    const int mi = x / grid - gx0;
+    const int mj = y / grid - gy0;
+    const int m = mj * stride + mi;
+    const float gi = float(grid - ii);
+    const float gj = float(grid - jj);
+    v = (points[m * 2] * gi * gj
+         + points[(m + 1) * 2] * float(ii) * gj
+         + points[(m + stride) * 2] * gi * float(jj)
+         + points[(m + stride + 1) * 2] * float(ii) * float(jj))
+        / float(grid * grid);
+  }
+  const float d = kind == 0 ? 0.0f : acc.readA(int2(x, y)).x;
+  out.write(int2(x, y), float4(_mask_fold(d, v, kind, opacity)));
+}
+
+// a member drawn on the host and uploaded as the tile covering rect, whose
+// origin is rect.xy, or a member group's whole mask; 0 outside rect
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void mask_fold_tile(uint3 gid : SV_DispatchThreadID,
+                    uniform ImageIn acc, uniform ImageIn tile, uniform ImageOut out,
+                    uniform int width, uniform int height, uniform int kind, uniform float opacity,
+                    uniform int4 rect)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const float v = x >= rect.x && x < rect.z && y >= rect.y && y < rect.w
+                  ? tile.readA(int2(x - rect.x, y - rect.y)).x : 0.0f;
+  const float d = kind == 0 ? 0.0f : acc.readA(int2(x, y)).x;
+  out.write(int2(x, y), float4(_mask_fold(d, v, kind, opacity)));
+}
+
+// a flexi group's invert output and opacity on its folded mask
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void mask_invert_scale(uint3 gid : SV_DispatchThreadID,
+                       uniform ImageIn in, uniform ImageOut out,
+                       uniform int width, uniform int height, uniform int invert, uniform float gain)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+  const float v = in.readA(int2(x, y)).x;
+  out.write(int2(x, y), float4((invert ? 1.0f - v : v) * gain));
+}
+
 // the luminance, scharr and detail blend kernels of the detail mask and of
 // dual demosaic
 [shader("compute")]

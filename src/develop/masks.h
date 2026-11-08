@@ -361,7 +361,20 @@ static inline gboolean dt_masks_point_is_marker(const dt_masks_point_group_t *pt
 typedef struct dt_masks_extent_t
 {
   int x0, y0, x1, y1;
+  /* set by the Slang device fold for circles, ellipses and gradients: the
+     shape fills nothing, hands over its values on the interpolation grid
+     here and sets x0..y1 to what the fill would have covered */
+  struct dt_masks_grid_t *grid;
 } dt_masks_extent_t;
+
+/** a shape's values on its interpolation grid: every second float of
+    values, stride points a row, rows rows, size pixels apart, the first at
+    grid point gx0, gy0. values belongs to whoever asked for it */
+typedef struct dt_masks_grid_t
+{
+  float *values;
+  int stride, rows, size, gx0, gy0;
+} dt_masks_grid_t;
 
 typedef struct dt_masks_functions_t
 {
@@ -997,6 +1010,19 @@ int dt_masks_group_render_roi(dt_iop_module_t *module,
                               const dt_iop_roi_t *roi,
                               float *buffer,
                               gboolean *pixels_missing);
+
+#ifdef HAVE_SLANG_GPU
+/** whether dt_masks_group_render_roi_slang() can render this group */
+gboolean dt_masks_group_slang_supported(const dt_dev_pixelpipe_iop_t *const piece,
+                                        dt_masks_form_t *const form);
+/** dt_masks_group_render_roi() into a device mask: NULL if the device
+    failed, else the mask, with *rendered FALSE when nothing rendered */
+struct dt_slang_gpu_image_t *dt_masks_group_render_roi_slang(dt_iop_module_t *module,
+                                                             dt_dev_pixelpipe_iop_t *piece,
+                                                             dt_masks_form_t *form,
+                                                             const dt_iop_roi_t *roi,
+                                                             gboolean *rendered);
+#endif
 
 // returns current masks version
 int dt_masks_version(void);

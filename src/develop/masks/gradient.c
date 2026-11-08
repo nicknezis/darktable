@@ -1348,6 +1348,13 @@ static int _gradient_get_mask_roi(const dt_iop_module_t *const module,
 
   dt_free_align(lut);
 
+  if(extent && extent->grid)
+  {
+    *extent->grid = (dt_masks_grid_t){ points, gw, gh, grid, 0, 0 };
+    *extent = (dt_masks_extent_t){ 0, 0, w, h, extent->grid };
+    return 1;
+  }
+
 // we fill the mask buffer by interpolation
   DT_OMP_FOR()
   for(int j = 0; j < h; j++)

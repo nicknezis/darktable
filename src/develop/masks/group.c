@@ -23,6 +23,9 @@
 #include "develop/imageop.h"
 #include "develop/masks.h"
 #include "develop/masks/group_internal.h"
+#ifdef HAVE_SLANG_GPU
+#include "common/slang_gpu.h"
+#endif
 
 static int _group_events_mouse_scrolled(dt_iop_module_t *module,
                                         const float pzx,
@@ -1345,6 +1348,257 @@ static int _group_get_mask_roi(const dt_iop_module_t *const restrict module,
 
   return nb_ok != 0;
 }
+
+#ifdef HAVE_SLANG_GPU
+// the kernels' fold kinds, as _extent_fold_t
+enum
+{
+  _SLANG_FOLD_FIRST = 0,
+  _SLANG_FOLD_MAXIMUM = 1,
+  _SLANG_FOLD_DIFFERENCE = 2,
+  _SLANG_FOLD_MINIMUM = 3,
+  _SLANG_FOLD_PRODUCT = 4,
+};
+
+// a flexi group the device fold below renders as the host fold does: shapes
+// and groups of them, folded by maximum, difference, minimum or product,
+// with no inversion or refinement of a member and no refinement of a group.
+// Anything else renders on the host
+static gboolean _group_slang_supported(const dt_dev_pixelpipe_iop_t *const piece,
+                                       dt_masks_form_t *const form,
+                                       const int depth)
+{
+  const dt_masks_point_group_t *const head = dt_masks_group_marker(form);
+  if(!head || depth > 16) return FALSE;
+  if(head->state & (DT_MASKS_STATE_FLEXI_SCREEN | DT_MASKS_STATE_FLEXI_SUM | DT_MASKS_STATE_FLEXI_EXCLUSION))
+    return FALSE;
+  const dt_dev_refine_bypass_t *const bypass = &piece->refine_bypass;
+  if(head->refinement.enabled == DT_MASKS_REFINE_GROUP
+     && !dt_masks_refine_bypass_lookup(bypass, dt_masks_refine_key_group(head->formid)))
+    return FALSE;
+  for(GList *fpts = form->points->next; fpts; fpts = g_list_next(fpts))
+  {
+    const dt_masks_point_group_t *const m = fpts->data;
+    if(m->state & (DT_MASKS_STATE_HIDDEN | DT_MASKS_STATE_DISABLE)) continue;
+    dt_masks_form_t *const sel = dt_masks_get_from_id_ext(piece->pipe->forms, m->formid);
+    if(!sel) continue;
+    if(m->state & DT_MASKS_STATE_INVERSE) return FALSE;
+    if(m->refinement.enabled == DT_MASKS_REFINE_ELEMENT
+       && !dt_masks_refine_bypass_lookup(bypass, dt_masks_refine_key_element(m->formid)))
+      return FALSE;
+    if(sel->type & DT_MASKS_GROUP)
+    {
+      if(!_group_slang_supported(piece, sel, depth + 1)) return FALSE;
+    }
+    else if(!_draws_extent(sel))
+      return FALSE;
+  }
+  return TRUE;
+}
+
+gboolean dt_masks_group_slang_supported(const dt_dev_pixelpipe_iop_t *const piece,
+                                        dt_masks_form_t *const form)
+{
+  const dt_develop_blend_params_t *const bp = piece->blendop_data;
+  return form && form->points && bp && (bp->mask_mode & DEVELOP_MASK_FLEXI)
+         && (form->type & DT_MASKS_GROUP) && _group_slang_supported(piece, form, 0);
+}
+
+// folds a member's values into the accumulator acc, writing out. The values
+// are 0 outside x0..x1, y0..y1; inside they come from the grid, if given,
+// or else from the tile, whose origin is x0, y0
+static int _fold_slang(dt_slang_gpu_image_t *acc,
+                       dt_slang_gpu_image_t *out,
+                       const int width,
+                       const int height,
+                       const int kind,
+                       const float opacity,
+                       dt_slang_gpu_buffer_t *grid,
+                       const int stride,
+                       const int gsize,
+                       const int gx0,
+                       const int gy0,
+                       dt_slang_gpu_image_t *tile,
+                       const int x0,
+                       const int y0,
+                       const int x1,
+                       const int y1)
+{
+  const int rect[4] = { x0, y0, x1, y1 };
+  if(grid)
+    return dt_slang_gpu_run_2d_args("blendop", "mask_fold_grid", width, height,
+             SLIMG_DEV(acc), SLBUF_DEV(grid), SLIMG_DEV(out), SLARG(width), SLARG(height), SLARG(kind),
+             SLARG(opacity), SLARG(gsize), SLARG(stride), SLARG(gx0), SLARG(gy0), SLARG(rect));
+  return dt_slang_gpu_run_2d_args("blendop", "mask_fold_tile", width, height,
+           SLIMG_DEV(acc), SLIMG_DEV(tile), SLIMG_DEV(out), SLARG(width), SLARG(height), SLARG(kind),
+           SLARG(opacity), SLARG(rect));
+}
+
+// _group_get_mask_roi_flexi() on the device, for a group that
+// dt_masks_group_slang_supported() accepts. The shapes still compute their
+// outlines and grid values on the host; circles, ellipses and gradients are
+// interpolated on the device, paths and brushes drawn on the host and
+// uploaded as the tile they cover. Returns the folded mask, or NULL if the
+// device failed. *rendered as dt_masks_get_mask_roi() returns: 0 for a
+// group with nothing to contribute, whose mask is then all ones
+static dt_slang_gpu_image_t *_group_fold_slang(const dt_iop_module_t *const module,
+                                               const dt_dev_pixelpipe_iop_t *const piece,
+                                               dt_masks_form_t *const form,
+                                               const dt_iop_roi_t *const roi,
+                                               float **scratch,
+                                               int *rendered)
+{
+  const dt_masks_point_group_t *const head = dt_masks_group_marker(form);
+  const int width = roi->width;
+  const int height = roi->height;
+  *rendered = 0;
+
+  const gboolean bypassed = (head->state & DT_MASKS_STATE_OP_BYPASS) != 0;
+  const gboolean flexi_minimum = (head->state & DT_MASKS_STATE_FLEXI_MINIMUM) != 0;
+  const gboolean flexi_product = (head->state & DT_MASKS_STATE_FLEXI_PRODUCT) != 0;
+  const gboolean flexi_difference = (head->state & DT_MASKS_STATE_FLEXI_DIFFERENCE) != 0;
+  const gboolean first_in_place = !(flexi_minimum || flexi_product);
+
+  dt_slang_gpu_image_t *acc = dt_slang_gpu_image_new(width, height, 1, NULL);
+  dt_slang_gpu_image_t *out = dt_slang_gpu_image_new(width, height, 1, NULL);
+  if(!acc || !out) goto error;
+  if(!first_in_place
+     && dt_slang_gpu_run_2d_args("blendop", "blendop_fill_mask", width, height,
+          SLIMG_DEV(acc), SLARG(width), SLARG(height), SLARG((float){ 1.0f })))
+    goto error;
+
+  int nb_folded = 0;
+  for(GList *fpts = form->points->next; fpts && !bypassed; fpts = g_list_next(fpts))
+  {
+    const dt_masks_point_group_t *const m = fpts->data;
+    if(m->state & (DT_MASKS_STATE_HIDDEN | DT_MASKS_STATE_DISABLE)) continue;
+    dt_masks_form_t *const sel = dt_masks_get_from_id_ext(piece->pipe->forms, m->formid);
+    if(!sel) continue;
+
+    const int kind = first_in_place && nb_folded == 0 ? _SLANG_FOLD_FIRST
+                     : flexi_difference              ? _SLANG_FOLD_DIFFERENCE
+                     : flexi_minimum                 ? _SLANG_FOLD_MINIMUM
+                     : flexi_product                 ? _SLANG_FOLD_PRODUCT
+                                                     : _SLANG_FOLD_MAXIMUM;
+    int err = 0;
+    if(sel->type & DT_MASKS_GROUP)
+    {
+      int sub_rendered = 0;
+      dt_slang_gpu_image_t *sub = _group_fold_slang(module, piece, sel, roi, scratch, &sub_rendered);
+      if(!sub) goto error;
+      // a member group with nothing to contribute is left out
+      if(sub_rendered)
+        err = _fold_slang(acc, out, width, height, kind, m->opacity, NULL, 0, 0, 0, 0, sub, 0, 0, width, height);
+      dt_slang_gpu_image_free(sub);
+      if(err) goto error;
+      if(!sub_rendered) continue;
+    }
+    else
+    {
+      if(!*scratch)
+      {
+        *scratch = dt_alloc_align_float((size_t)width * height);
+        if(!*scratch) goto error;
+      }
+      // x1 < x0 until the shape sets it
+      dt_masks_grid_t grid = { 0 };
+      dt_masks_extent_t extent = { 0, 0, -1, -1, &grid };
+      const int ok = dt_masks_get_mask_roi(module, piece, sel, roi, *scratch, &extent);
+      if(!ok)
+      {
+        dt_free_align(grid.values);
+        continue;
+      }
+      if(extent.x1 < extent.x0)
+      {
+        dt_print(DT_DEBUG_ALWAYS, "[masks] %s drew without setting its extent", sel->name);
+        dt_free_align(grid.values);
+        goto error;
+      }
+      const int x0 = CLAMP(extent.x0, 0, width);
+      const int y0 = CLAMP(extent.y0, 0, height);
+      const int x1 = CLAMP(extent.x1, x0, width);
+      const int y1 = CLAMP(extent.y1, y0, height);
+      if(grid.values)
+      {
+        dt_slang_gpu_buffer_t *dev_grid
+          = dt_slang_gpu_buffer_new(sizeof(float) * 2 * grid.stride * grid.rows, grid.values);
+        dt_free_align(grid.values);
+        err = !dev_grid
+              || _fold_slang(acc, out, width, height, kind, m->opacity, dev_grid, grid.stride, grid.size,
+                             grid.gx0, grid.gy0, NULL, x0, y0, x1, y1);
+        dt_slang_gpu_buffer_free(dev_grid);
+      }
+      else
+      {
+        const gboolean empty = x1 <= x0 || y1 <= y0;
+        // an empty rectangle still folds zeros, which clears for some kinds
+        dt_slang_gpu_image_t *tile = dt_slang_gpu_image_new(empty ? 1 : x1 - x0, empty ? 1 : y1 - y0, 1, NULL);
+        err = !tile
+              || (!empty
+                  && dt_slang_gpu_image_write_rect(tile, *scratch + (size_t)y0 * width + x0,
+                                                   sizeof(float) * width))
+              || _fold_slang(acc, out, width, height, kind, m->opacity, NULL, 0, 0, 0, 0, tile,
+                             x0, y0, empty ? x0 : x1, empty ? y0 : y1);
+        dt_slang_gpu_image_free(tile);
+      }
+      if(err) goto error;
+    }
+    // the result is the next fold's accumulator
+    dt_slang_gpu_image_t *tmp = acc;
+    acc = out;
+    out = tmp;
+    nb_folded++;
+  }
+
+  if(bypassed || nb_folded == 0)
+  {
+    // as the host fold: "no active mask element", fully opaque
+    if(dt_slang_gpu_run_2d_args("blendop", "blendop_fill_mask", width, height,
+         SLIMG_DEV(acc), SLARG(width), SLARG(height), SLARG((float){ 1.0f })))
+      goto error;
+    dt_slang_gpu_image_free(out);
+    return acc;
+  }
+
+  const int invert = (head->state & DT_MASKS_STATE_OP_INVERT) != 0;
+  const float gain = head->group_opacity;
+  if(invert || gain != 1.0f)
+  {
+    if(dt_slang_gpu_run_2d_args("blendop", "mask_invert_scale", width, height,
+         SLIMG_DEV(acc), SLIMG_DEV(out), SLARG(width), SLARG(height), SLARG(invert), SLARG(gain)))
+      goto error;
+    dt_slang_gpu_image_t *tmp = acc;
+    acc = out;
+    out = tmp;
+  }
+  dt_slang_gpu_image_free(out);
+  *rendered = 1;
+  return acc;
+
+error:
+  dt_slang_gpu_image_free(acc);
+  dt_slang_gpu_image_free(out);
+  return NULL;
+}
+
+dt_slang_gpu_image_t *dt_masks_group_render_roi_slang(dt_iop_module_t *module,
+                                                      dt_dev_pixelpipe_iop_t *piece,
+                                                      dt_masks_form_t *form,
+                                                      const dt_iop_roi_t *roi,
+                                                      gboolean *rendered)
+{
+  double start = dt_get_debug_wtime();
+  float *scratch = NULL;
+  int ok = 0;
+  dt_slang_gpu_image_t *mask = _group_fold_slang(module, piece, form, roi, &scratch, &ok);
+  dt_free_align(scratch);
+  *rendered = ok;
+  dt_print(DT_DEBUG_MASKS | DT_DEBUG_PERF,
+           "[masks] render all masks on the device took %0.04f sec", dt_get_lap_time(&start));
+  return mask;
+}
+#endif
 
 int dt_masks_group_render_roi(dt_iop_module_t *module,
                               dt_dev_pixelpipe_iop_t *piece,
