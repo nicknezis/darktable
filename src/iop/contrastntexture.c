@@ -38,7 +38,8 @@ Current status as implemented by Jandren:
   for highlights and shadows sliders which alter the contrast above and below middle grey.
 
 TERMINOLOGY:
-- detail level: absolute scale, log2(image size / kernel size), 0 == full image size.
+- detail level: absolute scale, log2(image size / detail size), 0 == full image size.
+  The detail size is in pixels, the filter gets a gaussian sigma of 0.375 x detail size.
 - pyramid level: index of a filter instance, 0 == the base detail level slider, +1 == half size.
   detail level = base detail level + pyramid level
 - max pyramid level: where the "fine" band reaches 100%.
@@ -82,9 +83,16 @@ TERMINOLOGY:
 #include <omp.h>
 #endif
 
-DT_MODULE_INTROSPECTION(2, dt_iop_contrastntexture_params_t)
+DT_MODULE_INTROSPECTION(3, dt_iop_contrastntexture_params_t)
 
+// Standard scene-referred midtone pivot.
 #define MIDDLE_GREY 0.1845f
+// Detail sizes in pixels for the low pass filter, a size of 1 px is the nyquist limit "half period".
+// Detail size 1 px barely extracts any feature, 2 px is therefore where the max_pyramid_level is placed.
+#define NYQUIST_SIZE 1.0f
+#define MINIMUM_SIZE (2.0f * NYQUIST_SIZE)
+// Gaussian sigma that gives a -6 dB response at the Nyquist frequency
+#define SIZE_TO_SIGMA 0.375f
 
 typedef struct dt_iop_contrastntexture_params_t
 {
@@ -113,7 +121,7 @@ typedef struct dt_iop_contrastntexture_data_t
 {
   float gain_details[DT_LC_MASK_LAST];
   // indexed by pyramid level
-  float radius_details[MAX_ITERATIONS];
+  float size_details[MAX_ITERATIONS];
   float scale_details[MAX_ITERATIONS];
   float noise_bias[MAX_ITERATIONS];
   float max_pyramid_level;
@@ -229,6 +237,20 @@ int legacy_params(dt_iop_module_t *self,
     *new_version = 2;
     return 0;
   }
+  if(old_version == 2)
+  {
+    // v3 changed the filter sigma from 0.5 x detail size to SIZE_TO_SIGMA x detail size.
+    // Lowering the base detail level by log2(0.5 / SIZE_TO_SIGMA) keeps the sigma of every filter
+    // instance as it was. Exact except where the hard minimum of the slider clamps it.
+    dt_iop_contrastntexture_params_t *n = calloc(1, sizeof(dt_iop_contrastntexture_params_t));
+    memcpy(n, old_params, sizeof(dt_iop_contrastntexture_params_t));
+    n->base_detail_level = fmaxf(n->base_detail_level - log2f(0.5f / SIZE_TO_SIGMA), 1.0f);
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_contrastntexture_params_t);
+    *new_version = 3;
+    return 0;
+  }
   return 1;
 }
 
@@ -267,9 +289,10 @@ static inline void compute_mask(float *const restrict log_smoothed_luminance,
 {
   const size_t width = (size_t)roi_in->width;
   const size_t height = (size_t)roi_in->height;
+  const float sigma = SIZE_TO_SIGMA * d->size_details[pyramid_level];
 
   fast_gaussian_guided_filter(log_smoothed_luminance, width, height,
-                        d->radius_details[pyramid_level], d->feathering);
+                              sigma, d->feathering);
 }
 
 // Extract logarithmic high pass detail in log space (EV):
@@ -307,13 +330,13 @@ static inline float band_weight(const dt_iop_contrastntexture_details_display_t 
   return weight * weight;
 }
 
-// The finest pyramid level of the band weights for a full resolution image, i.e. the pyramid level
-// with a radius of 2 pixels. It is independent of the preview scale, so the band weights match
+// The pyramid level where the detail size == MINIMUM_SIZE for a full resolution image, i.e. where the
+// "fine" band reaches 100%. It is independent of the preview scale, so the band weights match
 // between the preview and the full pipe.
 static inline float max_pyramid_level_for(const float max_image_size,
                                           const float base_detail_level)
 {
-  return log2f(max_image_size) - base_detail_level - 2.0f;
+  return log2f(max_image_size) - log2f(MINIMUM_SIZE) - base_detail_level;
 }
 
 // Apply shadow and highlight enhancement
@@ -562,24 +585,20 @@ void modify_roi_in(dt_iop_module_t *self,
 {
   dt_iop_contrastntexture_data_t *const d = piece->data;
 
-  // Get the scaled window radius for the box average
+  // Detail size in pixels of each pyramid level at the current scale
   const float max_size = (float)((piece->iwidth > piece->iheight) ? piece->iwidth : piece->iheight);
   for(int pyramid_level = 0; pyramid_level < MAX_ITERATIONS; pyramid_level++)
   {
     const float base_diameter = max_size * roi_in->scale;
-    const float radius = 0.5f * fminf(d->scale_details[pyramid_level], 0.5f) * base_diameter;
-    d->radius_details[pyramid_level] = radius;
+    d->size_details[pyramid_level] = base_diameter * d->scale_details[pyramid_level];
   }
 
-  // Find the smallest pyramid level with non zero radius.
-  d->max_used_pyramid_level = MAX_ITERATIONS - 1;
-  for(int pyramid_level = MAX_ITERATIONS - 1; pyramid_level >= 0; pyramid_level--)
+  // The last level, i.e. the top of the pyramid that still has a usable size, level 0 is always processed.
+  d->max_used_pyramid_level = 0;
+  for(int pyramid_level = 1; pyramid_level < MAX_ITERATIONS; pyramid_level++)
   {
-    // If the radius is <2.0 pixels, the next pyramid level will be unused (<1.0)
-    if(d->radius_details[pyramid_level] < 2.0f)
-    {
-      d->max_used_pyramid_level = pyramid_level;
-    }
+    if(d->size_details[pyramid_level] < NYQUIST_SIZE) break;
+    d->max_used_pyramid_level = pyramid_level;
   }
 }
 
@@ -1082,7 +1101,7 @@ static gboolean gain_graph_draw(GtkWidget *widget,
   const float max_image_size = gui_max_image_size(self);
 
   const float x_min = 1.0f;
-  const float x_max = fmaxf(log2f(max_image_size) - 1.0f, x_min + 1.0f);
+  const float x_max = fmaxf(max_pyramid_level_for(max_image_size, 0.0f) + 1.0f, x_min);
   const float max_pyramid_level = max_pyramid_level_for(max_image_size, p->base_detail_level);
   const float band_gains[DT_LC_MASK_LAST] = { p->gain_coarse, p->gain_medium, p->gain_fine };
 
@@ -1165,10 +1184,10 @@ static gboolean gain_graph_draw(GtkWidget *widget,
   int max_used_pyramid_level = 0;
   for(int pyramid_level = 0; pyramid_level < MAX_ITERATIONS; pyramid_level++)
   {
+    const float scale = powf(2.0f, -p->base_detail_level - (float)pyramid_level);
+    const float detail_size = max_image_size * scale;
+    if(pyramid_level > 0 && detail_size < NYQUIST_SIZE) break;
     max_used_pyramid_level = pyramid_level;
-    const float radius = 0.5f * fminf(powf(2.0f, -p->base_detail_level - (float)pyramid_level), 0.5f)
-                         * max_image_size;
-    if(radius < 2.0f) break;
   }
   cairo_save(cr);
   cairo_rectangle(cr, 0, 0, width, height);
@@ -1280,7 +1299,6 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(self->widget, g->gain_graph);
 
   g->base_detail_level = dt_bauhaus_slider_from_params(self, "base_detail_level");
-  dt_bauhaus_slider_set_soft_range(g->base_detail_level, 1.0, 10.0);
   gtk_widget_set_tooltip_text(g->base_detail_level,
      _("adjust the detail level used for highlights, shadows, and coarse details.\n"
        "higher = more contrast boost in finer details\n"

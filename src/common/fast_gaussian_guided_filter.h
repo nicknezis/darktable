@@ -21,12 +21,13 @@
 #include <math.h>
 #include <float.h>  // FLT_MAX
 
-#include "common/fast_guided_filter.h" // interpolate_bilinear
 #include "common/gaussian.h"           // dt_gaussian_*
 
 // Guided filter surface gaussian blurring with edge preservation.
 // supports negative values for log-luminance data (any sign).
-// Blurs in-place on a downscaled grey image.
+// This implementation avoids downscaling (as done in eigf) and works directly on the full-resolution image,
+// ensuring higher accuracy at the cost of a roughly ~2x increased computational load.
+
 __DT_CLONE_TARGETS__
 static inline void fast_gaussian_guided_filter(float *const restrict image,
                                                const size_t width,
@@ -34,70 +35,69 @@ static inline void fast_gaussian_guided_filter(float *const restrict image,
                                                const float sigma,
                                                const float feathering)
 {
-  const float scaling = fmaxf(fminf(sigma, 4.0f), 1.0f);
-  const float downsampled_sigma = fmaxf(sigma / scaling, 1.0f);
-
-  const size_t downsampled_height = height / scaling;
-  const size_t downsampled_width = width / scaling;
-  const size_t num_elem_ds = downsampled_width * downsampled_height;
   const size_t num_elem = width * height;
+  // holds the squared image, then its blur (the gaussian supports in-place use)
+  float *const restrict blurred_image = dt_alloc_align_float(num_elem);
+  float *const restrict blurred_squared_image = dt_alloc_align_float(num_elem);
 
-  float *const restrict downsampled_image = dt_alloc_align_float(num_elem_ds);
-  float *const restrict gaussian_input = dt_alloc_align_float(num_elem_ds * 2);
-  // Statistics for the guide; average and variance; downsampled and full resolution versions.
-  float *const restrict downsampled_statistics = dt_alloc_align_float(num_elem_ds * 2);
-  float *const restrict full_resolution_statistics = dt_alloc_align_float(num_elem * 2);
-
-  if(!downsampled_image || !gaussian_input || !downsampled_statistics || !full_resolution_statistics)
+  if(!blurred_image || !blurred_squared_image)
   {
     dt_control_log(_("fast gaussian guided filter failed to allocate memory, check your RAM settings"));
     goto clean;
   }
-
-  interpolate_bilinear(image, width, height, downsampled_image, downsampled_width, downsampled_height, 1);
 
   // channels: value and squared value, with ranges for the gaussian
   float ming = FLT_MAX;
   float maxg = -FLT_MAX;
   float maxg2 = 0.0f;
   DT_OMP_FOR(reduction(max:maxg, maxg2) reduction(min:ming))
-  for(size_t k = 0; k < num_elem_ds; k++)
+  for(size_t k = 0; k < num_elem; k++)
   {
-    const float p = downsampled_image[k];
-    gaussian_input[2 * k] = p;
-    gaussian_input[2 * k + 1] = p * p;
-    ming = fminf(ming, p);
-    maxg = fmaxf(maxg, p);
-    maxg2 = fmaxf(maxg2, p * p);
+    const float pixel_value = image[k];
+    blurred_squared_image[k] = pixel_value * pixel_value;
+    ming = fminf(ming, pixel_value);
+    maxg = fmaxf(maxg, pixel_value);
+    maxg2 = fmaxf(maxg2, pixel_value * pixel_value);
   }
   // squares of values spanning zero have a minimum of 0
-  const float ming2 = (ming <= 0.0f && maxg >= 0.0f) ? 0.0f
-                      : fminf(ming * ming, maxg * maxg);
+  const float ming2 = 0.0f;
 
-  const float channel_max[2] = { maxg, maxg2 };
-  const float channel_min[2] = { ming, ming2 };
-  dt_gaussian_t *g = dt_gaussian_init(downsampled_width, downsampled_height, 2, channel_max, channel_min, downsampled_sigma, 0);
-  if(!g) goto clean;
-  dt_gaussian_blur(g, gaussian_input, downsampled_statistics);
+  // Blur the image to obtain the local average
+  const float image_max[1] = { maxg };
+  const float image_min[1] = { ming };
+  dt_gaussian_t *g = dt_gaussian_init(width, height, 1, image_max, image_min, sigma, 0);
+  if(!g)
+  {
+    dt_control_log(_("fast gaussian guided filter failed to initialize gaussian structure"));
+    goto clean;
+  }
+  dt_gaussian_blur(g, image, blurred_image);
   dt_gaussian_free(g);
 
-  interpolate_bilinear(downsampled_statistics, downsampled_width, downsampled_height,
-                       full_resolution_statistics, width, height, 2);
+  // Blur the squared image to obtain the local variance
+  const float squared_max[1] = { maxg2 };
+  const float squared_min[1] = { ming2 };
+  g = dt_gaussian_init(width, height, 1, squared_max, squared_min, sigma, 0);
+  if(!g)
+  {
+    dt_control_log(_("fast gaussian guided filter failed to initialize gaussian structure for squared image"));
+    goto clean;
+  }
+  dt_gaussian_blur(g, blurred_squared_image, blurred_squared_image);
+  dt_gaussian_free(g);
 
   DT_OMP_FOR()
   for(size_t k = 0; k < num_elem; k++)
   {
-    const float average = full_resolution_statistics[2 * k];
-    const float variance = fmaxf(full_resolution_statistics[2 * k + 1] - average * average, 0.0f);
+    const float average = blurred_image[k];
+    const float variance = fmaxf(blurred_squared_image[k] - average * average, 0.0f);
     const float a = variance / (variance + feathering);
     image[k] = a * image[k] + (1.0f - a) * average;
   }
 
-clean:
-  dt_free_align(full_resolution_statistics);
-  dt_free_align(downsampled_statistics);
-  dt_free_align(gaussian_input);
-  dt_free_align(downsampled_image);
+  clean:
+  dt_free_align(blurred_image);
+  dt_free_align(blurred_squared_image);
 }
 
 // clang-format off
