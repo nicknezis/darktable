@@ -101,6 +101,44 @@ bool _in(const AmazePix p, const int m)
   return p.c >= m && p.c < p.cc1 - m && p.r >= m && p.r < p.rr1 - m;
 }
 
+// a pass that reads only the raw data gives the same value in every tile
+// that holds a pixel, so it runs once per pixel of the padded image. It
+// reads the tile that holds the pixel farthest from its edges and writes
+// the value to every tile where the CPU computes it (m pixels inside).
+typedef struct
+{
+  int i;          // index of the pixel in the tile it reads
+  int col, row;   // position in the padded image
+  int n;          // number of tiles it writes, 0 for none
+  int dst[4];     // its index in each of them
+} AmazeShared;
+
+AmazeShared _shared(const int pw, const int ph, const int m)
+{
+  AmazeShared s;
+  s.col = get_global_id(0);
+  s.row = get_global_id(1);
+  s.n = 0;
+  s.i = 0;
+  if(s.col >= pw || s.row >= ph) return s;
+  const int ntx = (pw - 16 + 127) / 128;
+  const int nty = (ph - 16 + 127) / 128;
+  // the tile whose rows and columns 16 to 143 hold the pixel
+  const int otx = min(max(s.col - 16, 0) / 128, ntx - 1);
+  const int oty = min(max(s.row - 16, 0) / 128, nty - 1);
+  s.i = (oty * ntx + otx) * TS * TS + (s.row - oty * 128) * TS + s.col - otx * 128;
+  for(int ty = max(oty - 1, 0); ty <= min(oty + 1, nty - 1); ty++)
+    for(int tx = max(otx - 1, 0); tx <= min(otx + 1, ntx - 1); tx++)
+    {
+      const int c = s.col - tx * 128, r = s.row - ty * 128;
+      if(c >= m && c < min(TS, pw - tx * 128) - m && r >= m && r < min(TS, ph - ty * 128) - m)
+        s.dst[s.n++] = (ty * ntx + tx) * TS * TS + r * TS + c;
+    }
+  return s;
+}
+
+#define SHARED_STORE(buf, v) for(int k = 0; k < s.n; k++) (buf)[s.dst[k]] = (v)
+
 // the 16 pixel border mirrors the image without repeating its edge pixel,
 // which keeps the CFA phase
 int _mirror(int i, int n)
@@ -151,25 +189,24 @@ kernel void amaze_init(
                 read_only image2d_t in, global float *cfa,
                 const int width, const int height, const int pw, const int ph)
 {
-  const AmazePix px = _pix(pw, ph);
-  if(px.c >= px.cc1 || px.r >= px.rr1) return;
-  const int x = px.col - 16, y = px.row - 16;
+  const AmazeShared s = _shared(pw, ph, 0);
+  if(s.n == 0) return;
+  const int x = s.col - 16, y = s.row - 16;
   const bool xout = x < 0 || x >= width, yout = y < 0 || y >= height;
   // the CPU fills the top left, top right and bottom left corners of the
   // border from 16 pixels further in than the edges (amaze.cc:349)
   const int sx = x < 0 && yout ? 16 - x : _mirror(x, width);
   const int sy = y < 0 && xout ? 16 - y : _mirror(y, height);
-  cfa[px.i] = Areadsingle(in, sx, sy);
+  SHARED_STORE(cfa, Areadsingle(in, sx, sy));
 }
 
 kernel void amaze_grad(
                 global float *cfa, global float *delhvsqsum, const int pw, const int ph)
 {
-  const AmazePix px = _pix(pw, ph);
-  const int col = px.col, row = px.row;
-  if(!_in(px, 2)) return;
-  const int i = px.i;
-  delhvsqsum[i] = fsquare(fabs(cfa[i + 1] - cfa[i - 1])) + fsquare(fabs(cfa[i + TS] - cfa[i - TS]));
+  const AmazeShared s = _shared(pw, ph, 2);
+  if(s.n == 0) return;
+  const int i = s.i;
+  SHARED_STORE(delhvsqsum, fsquare(fabs(cfa[i + 1] - cfa[i - 1])) + fsquare(fabs(cfa[i + TS] - cfa[i - TS])));
 }
 
 // interpolate vertical and horizontal color differences
@@ -178,11 +215,11 @@ kernel void amaze_cd(
               global float *dgintv, global float *dginth,
               const int pw, const int ph, const unsigned int filters, const float clip_pt8)
 {
-  const AmazePix px = _pix(pw, ph);
-  const int col = px.col, row = px.row;
-  if(!_in(px, 4)) return;
+  const AmazeShared s = _shared(pw, ph, 4);
+  if(s.n == 0) return;
+  const int col = s.col, row = s.row;
   const int v1 = TS, v2 = 2 * TS;
-  const int i = px.i;
+  const int i = s.i;
   const float c0 = cfa[i];
 
   const float d0m2 = _dirwts0(cfa, i - v2, v1), d0 = _dirwts0(cfa, i, v1), d0p2 = _dirwts0(cfa, i + v2, v1);
@@ -241,13 +278,15 @@ kernel void amaze_cd(
     h = ha;
   }
 
-  vcd[i] = v;
-  hcd[i] = h;
-  vcdalt[i] = va;
-  hcdalt[i] = ha;
   // differences of interpolations in opposite directions
-  dgintv[i] = fmin(fsquare(guha - gdha), fsquare(guar - gdar));
-  dginth[i] = fmin(fsquare(glha - grha), fsquare(glar - grar));
+  const float gv = fmin(fsquare(guha - gdha), fsquare(guar - gdar));
+  const float gh = fmin(fsquare(glha - grha), fsquare(glar - grar));
+  SHARED_STORE(vcd, v);
+  SHARED_STORE(hcd, h);
+  SHARED_STORE(vcdalt, va);
+  SHARED_STORE(hcdalt, ha);
+  SHARED_STORE(dgintv, gv);
+  SHARED_STORE(dginth, gh);
 }
 
 // the CPU tile of the work group
@@ -609,12 +648,11 @@ kernel void amaze_diag(
                 global float *cfa, global float *rbm, global float *rbp, global float *pmwt,
                 const int pw, const int ph, const unsigned int filters, const float clip_pt)
 {
-  const AmazePix px = _pix(pw, ph);
-  const int col = px.col, row = px.row;
-  if(!_in(px, 8) || (FC(row, col, filters) & 1) != 0) return;
+  const AmazeShared s = _shared(pw, ph, 8);
+  if(s.n == 0 || (FC(s.row, s.col, filters) & 1) != 0) return;
   const int ts = TS;
   const int p1 = -ts + 1, p2 = -2 * ts + 2, m1 = ts + 1, m2 = 2 * ts + 2;
-  const int i = px.i;
+  const int i = s.i;
   const float c0 = cfa[i];
 
   // diagonal color ratios
@@ -640,7 +678,7 @@ kernel void amaze_diag(
 
   // variance of R-B in plus/minus directions
   const float rbvarm = _rbvar(cfa, i, ts, false);
-  pmwt[i] = fp32_div(rbvarm, _rbvar(cfa, i, ts, true) + rbvarm);
+  SHARED_STORE(pmwt, fp32_div(rbvarm, _rbvar(cfa, i, ts, true) + rbvarm));
 
   // bound the interpolation in regions of high saturation
   if(p < c0)
@@ -666,8 +704,8 @@ kernel void amaze_diag(
   if(p > clip_pt) p = _ulim(p, cfa[i - p1], cfa[i + p1]);
   if(m > clip_pt) m = _ulim(m, cfa[i - m1], cfa[i + m1]);
 
-  rbm[i] = m;
-  rbp[i] = p;
+  SHARED_STORE(rbm, m);
+  SHARED_STORE(rbp, p);
 }
 
 // R+B interpolated

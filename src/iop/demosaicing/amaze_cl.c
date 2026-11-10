@@ -69,13 +69,13 @@ static int process_amaze_cl(dt_iop_module_t *self,
   cl_mem rbm = b[8], rbp = b[1], pmwt = b[11], pmwt2 = b[10], rbint = b[2];
   cl_mem dgr = b[6], dgb = b[7];
 
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_init, gw, gh,
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_init, pw, ph,
           CLARG(dev_in), CLARG(cfa), CLARG(width), CLARG(height), CLARG(pw), CLARG(ph));
   if(err != CL_SUCCESS) goto error;
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_grad, gw, gh,
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_grad, pw, ph,
           CLARG(cfa), CLARG(delhvsqsum), CLARG(pw), CLARG(ph));
   if(err != CL_SUCCESS) goto error;
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_cd, gw, gh,
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_cd, pw, ph,
           CLARG(cfa), CLARG(vcd), CLARG(hcd), CLARG(vcdalt), CLARG(hcdalt), CLARG(dgintv), CLARG(dginth),
           CLARG(pw), CLARG(ph), CLARG(filters), CLARG(clip_pt8));
   if(err != CL_SUCCESS) goto error;
@@ -104,7 +104,7 @@ static int process_amaze_cl(dt_iop_module_t *self,
           CLARG(cfa), CLARG(vcd2), CLARG(hcd2), CLARG(nyquist2), CLARG(dgrb2h), CLARG(dgrb2v),
           CLARG(dgrb), CLARG(green), CLARG(pw), CLARG(ph), CLARG(filters));
   if(err != CL_SUCCESS) goto error;
-  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_diag, gw, gh,
+  err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_amaze_diag, pw, ph,
           CLARG(cfa), CLARG(rbm), CLARG(rbp), CLARG(pmwt), CLARG(pw), CLARG(ph), CLARG(filters),
           CLARG(clip_pt));
   if(err != CL_SUCCESS) goto error;
