@@ -153,6 +153,7 @@ typedef struct dt_iop_contrastntexture_gui_data_t
   // Read-only graph of the total gain per detail size
   dt_iop_contrastntexture_details_display_t details_display;
   GtkWidget *gain_graph;
+  dt_gui_collapsible_section_t graph_section;
 
   // GTK widgets adjustments
   GtkWidget *gain_details[DT_LC_MASK_LAST]; // coarse, medium, and fine
@@ -1290,13 +1291,15 @@ void gui_init(dt_iop_module_t *self)
   // Main container
   self->widget = dt_gui_vbox();
 
+  dt_gui_new_collapsible_section(&g->graph_section, "plugins/darkroom/contrastntexture/expand_gain_graph",
+                                 _("show gain graph"), GTK_BOX(self->widget), DT_ACTION(self));
   g->gain_graph = dtgtk_drawing_area_new_with_aspect_ratio(0.5f);
   gtk_widget_set_tooltip_text(g->gain_graph,
      _("total gain applied per detail size.\n"
        "solid vertical line: base detail level\n"
        "dashed vertical lines: filter instances (pyramid levels) in use"));
   g_signal_connect(G_OBJECT(g->gain_graph), "draw", G_CALLBACK(gain_graph_draw), self);
-  dt_gui_box_add(self->widget, g->gain_graph);
+  dt_gui_box_add(g->graph_section.container, g->gain_graph);
 
   g->base_detail_level = dt_bauhaus_slider_from_params(self, "base_detail_level");
   gtk_widget_set_tooltip_text(g->base_detail_level,
