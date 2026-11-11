@@ -1,5 +1,6 @@
 #
-# compile the Slang kernels to SPIR-V, and to a Metal library on macOS with Xcode
+# compile the Slang kernels to SPIR-V, and on macOS to Metal libraries with
+# Xcode or to Metal source without it
 #
 # Nothing in darktable loads these yet: the OpenCL code path keeps using the
 # .cl sources one directory up.
@@ -30,6 +31,9 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 # DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
 set(DT_SLANG_OUTPUTS "")
+if(APPLE)
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/entries")
+endif()
 set(DT_SLANG_INSTALL "")
 
 foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
@@ -45,14 +49,16 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
   list(APPEND DT_SLANG_OUTPUTS ${SPV})
   list(APPEND DT_SLANG_INSTALL ${SPV})
 
-  if(DT_SLANG_METALLIB)
-    # one library per entry point: Slang numbers Metal buffer and texture
-    # indices across all entry points of a file, and a kernel can only use
-    # buffers 0-30. Compiled alone, each entry point starts at 0 again. The
-    # libraries can't be linked into one, since every one of them defines
-    # Slang's helper functions. The entry points come from the Metal source,
-    # since some are declared through macros.
-    set(METAL_ALL "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.entries.metal")
+  if(APPLE)
+    # one library or source file per entry point: Slang numbers Metal buffer
+    # and texture indices across all entry points of a file, and a kernel
+    # can only use buffers 0-30. Compiled alone, each entry point starts at
+    # 0 again. The libraries can't be linked into one, since every one of
+    # them defines Slang's helper functions. The entry points come from the
+    # Metal source, since some are declared through macros.
+    # kept out of the kernel directory, where the Metal backend would take
+    # it for a kernel
+    set(METAL_ALL "${CMAKE_CURRENT_BINARY_DIR}/entries/${KERNAME}.metal")
     execute_process(COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -target metal ${DT_SLANG_FLAGS} -o ${METAL_ALL}
                     RESULT_VARIABLE SLANGC_RESULT OUTPUT_QUIET ERROR_QUIET)
     if(NOT SLANGC_RESULT EQUAL 0)
@@ -62,22 +68,36 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES})
     foreach(ENTRY IN ITEMS ${ENTRIES})
       string(REGEX REPLACE "^\\[\\[kernel\\]\\] void ([A-Za-z0-9_]+)\\(.*" "\\1" ENTRY "${ENTRY}")
-      set(METALLIB "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metallib")
-      # Metal compiles with fast math unless told otherwise, which lets it
-      # rearrange the exact additions of Kahan_sum() in common.slang and
-      # loosens results that the OpenCL kernels compute without it
-      add_custom_command(
-        OUTPUT  ${METALLIB}
-        COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -Xmetal -fno-fast-math -o ${METALLIB}
-        DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
-        COMMENT "Compiling Slang kernel ${KERNAME}:${ENTRY} to a Metal library"
-      )
-      list(APPEND DT_SLANG_OUTPUTS ${METALLIB})
-      list(APPEND DT_SLANG_INSTALL ${METALLIB})
+      if(DT_SLANG_METALLIB)
+        set(METALLIB "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metallib")
+        # Metal compiles with fast math unless told otherwise, which lets it
+        # rearrange the exact additions of Kahan_sum() in common.slang and
+        # loosens results that the OpenCL kernels compute without it
+        add_custom_command(
+          OUTPUT  ${METALLIB}
+          COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -Xmetal -fno-fast-math -o ${METALLIB}
+          DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
+          COMMENT "Compiling Slang kernel ${KERNAME}:${ENTRY} to a Metal library"
+        )
+        list(APPEND DT_SLANG_OUTPUTS ${METALLIB})
+        list(APPEND DT_SLANG_INSTALL ${METALLIB})
+      else()
+        # compiled at run time by src/common/slang_gpu_metal.m, also without
+        # fast math
+        set(METAL "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metal")
+        add_custom_command(
+          OUTPUT  ${METAL}
+          COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metal ${DT_SLANG_FLAGS} -o ${METAL}
+          DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
+          COMMENT "Translating Slang kernel ${KERNAME}:${ENTRY} to Metal source"
+        )
+        list(APPEND DT_SLANG_OUTPUTS ${METAL})
+        list(APPEND DT_SLANG_INSTALL ${METAL})
+      endif()
     endforeach()
   else()
-    # without Apple's metal compiler, generating the source still catches
-    # kernels that do not translate to Metal, and it can be compiled at runtime
+    # elsewhere, translating to Metal still catches kernels that do not
+    # translate
     set(METAL "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.metal")
     add_custom_command(
       OUTPUT  ${METAL}
