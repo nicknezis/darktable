@@ -1100,8 +1100,10 @@ void process(dt_iop_module_t *self,
                     rgb[c][indx] = rgb[1][indx] - grbdiffint;
                 }
 
-                // if colour difference interpolation overshot the correction, just desaturate
-                if(grbdiffold * grbdiffint < 0)
+                // if colour difference interpolation overshot the correction, just desaturate.
+                // grbdiffold is exactly 0 at clipped sensels, and a few ulp of rounding must not
+                // decide its sign, see data/kernels/cacorrect.cl
+                if(grbdiffold * grbdiffint < 0 && fabsf(grbdiffold) > 1e-6f)
                   rgb[c][indx] = rgb[1][indx] - 0.5f * (grbdiffold + grbdiffint);
               }
             }

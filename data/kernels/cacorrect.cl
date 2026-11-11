@@ -382,8 +382,10 @@ cacorrect_correct(global const float *raw,
     if(fabs(grbdiffold) > fabs(grbdiffint)) o = g - grbdiffint;
   }
 
-  // if color difference interpolation overshot the correction, just desaturate
-  if(grbdiffold * grbdiffint < 0.0f) o = g - 0.5f * (grbdiffold + grbdiffint);
+  // if color difference interpolation overshot the correction, just desaturate.
+  // grbdiffold is exactly 0 at clipped sensels, and a few ulp of rounding must
+  // not decide its sign
+  if(grbdiffold * grbdiffint < 0.0f && fabs(grbdiffold) > 1e-6f) o = g - 0.5f * (grbdiffold + grbdiffint);
   out[mad24(row, width, col)] = o;
 }
 
