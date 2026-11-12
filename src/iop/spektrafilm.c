@@ -614,9 +614,9 @@ typedef struct dt_iop_spektrafilm_global_data_t
       kernel_grain_add, kernel_grain_usm;
   int kernel_print_expose, kernel_print_develop, kernel_scan, kernel_passthrough;
   int kernel_crop_out, kernel_scan_usm, kernel_glare_gen;
-  int kernel_scatter_combine, kernel_accum, kernel_channel_extract, kernel_channel_accum, kernel_halation_apply;
+  int kernel_scatter_combine, kernel_accum, kernel_halation_apply;
   int kernel_gauss_row_4c, kernel_gauss_col_4c, kernel_gauss_row_1c, kernel_gauss_col_1c;
-  int kernel_yvv_row_4c, kernel_yvv_col_4c, kernel_yvv_row_1c, kernel_yvv_col_1c;
+  int kernel_yvv_row_4c, kernel_yvv_col_4c;
   int kernel_wide_rows, kernel_wide_down, kernel_wide_up;
   int kernel_boost, kernel_diffusion_accum, kernel_diffusion_mix;
   int kernel_pow10, kernel_log10;
@@ -687,11 +687,8 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_passthrough = dt_opencl_create_kernel(program, "spektrafilm_passthrough");
   gd->kernel_scatter_combine = dt_opencl_create_kernel(program, "spektrafilm_scatter_combine");
   gd->kernel_accum = dt_opencl_create_kernel(program, "spektrafilm_accum");
-  gd->kernel_channel_extract = dt_opencl_create_kernel(program, "spektrafilm_channel_extract");
   gd->kernel_yvv_row_4c = dt_opencl_create_kernel(program, "spektrafilm_yvv_row_4c");
   gd->kernel_yvv_col_4c = dt_opencl_create_kernel(program, "spektrafilm_yvv_col_4c");
-  gd->kernel_yvv_row_1c = dt_opencl_create_kernel(program, "spektrafilm_yvv_row_1c");
-  gd->kernel_yvv_col_1c = dt_opencl_create_kernel(program, "spektrafilm_yvv_col_1c");
   gd->kernel_wide_rows = dt_opencl_create_kernel(program, "spektrafilm_wide_rows");
   gd->kernel_wide_down = dt_opencl_create_kernel(program, "spektrafilm_wide_down");
   gd->kernel_wide_up = dt_opencl_create_kernel(program, "spektrafilm_wide_up");
@@ -699,7 +696,6 @@ void init_global(dt_iop_module_so_t *self)
   gd->kernel_gauss_col_4c = dt_opencl_create_kernel(program, "spektrafilm_gauss_col_4c");
   gd->kernel_gauss_row_1c = dt_opencl_create_kernel(program, "spektrafilm_gauss_row_1c");
   gd->kernel_gauss_col_1c = dt_opencl_create_kernel(program, "spektrafilm_gauss_col_1c");
-  gd->kernel_channel_accum = dt_opencl_create_kernel(program, "spektrafilm_channel_accum");
   gd->kernel_halation_apply = dt_opencl_create_kernel(program, "spektrafilm_halation_apply");
   gd->kernel_boost = dt_opencl_create_kernel(program, "spektrafilm_boost");
   gd->kernel_diffusion_accum = dt_opencl_create_kernel(program, "spektrafilm_diffusion_accum");
@@ -731,11 +727,8 @@ void cleanup_global(dt_iop_module_so_t *self)
     dt_opencl_free_kernel(gd->kernel_passthrough);
     dt_opencl_free_kernel(gd->kernel_scatter_combine);
     dt_opencl_free_kernel(gd->kernel_accum);
-    dt_opencl_free_kernel(gd->kernel_channel_extract);
     dt_opencl_free_kernel(gd->kernel_yvv_row_4c);
     dt_opencl_free_kernel(gd->kernel_yvv_col_4c);
-    dt_opencl_free_kernel(gd->kernel_yvv_row_1c);
-    dt_opencl_free_kernel(gd->kernel_yvv_col_1c);
     dt_opencl_free_kernel(gd->kernel_wide_rows);
     dt_opencl_free_kernel(gd->kernel_wide_down);
     dt_opencl_free_kernel(gd->kernel_wide_up);
@@ -743,7 +736,6 @@ void cleanup_global(dt_iop_module_so_t *self)
     dt_opencl_free_kernel(gd->kernel_gauss_col_4c);
     dt_opencl_free_kernel(gd->kernel_gauss_row_1c);
     dt_opencl_free_kernel(gd->kernel_gauss_col_1c);
-    dt_opencl_free_kernel(gd->kernel_channel_accum);
     dt_opencl_free_kernel(gd->kernel_halation_apply);
     dt_opencl_free_kernel(gd->kernel_boost);
     dt_opencl_free_kernel(gd->kernel_diffusion_accum);
@@ -2183,14 +2175,14 @@ void tiling_callback(dt_iop_module_t *self,
      adds 1.5 and grain up to 2.0 at the maximum sub-layer count. The stages
      run one after another, so grain sets the peak at 5.75.
      OpenCL: input + output plus five float4 buffers (plane, plane2, tmpa, acc,
-     gtmp4) and two single-channel ones (plane1, gtmp1), a 7.5 baseline; the
+     gtmp4) and a single-channel one (gtmp1), a 7.25 baseline; the
      grain stage adds an accumulator and one buffer per sub-layer, up to 2.25.
      Understating these lets the tiler pick tiles that then fail to allocate,
      and the CPU path answers an allocation failure with a passthrough of that
      tile -- unprocessed rectangles inside an otherwise processed frame, not a
      clean skip -- so the estimate has to be an upper bound. */
   tiling->factor = 5.75f;
-  tiling->factor_cl = 9.75f;
+  tiling->factor_cl = 9.5f;
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = 1.0f;
   /* Constant tables uploaded once per run and independent of tile size: the
@@ -2655,10 +2647,48 @@ void process(dt_iop_module_t *self,
   dt_free_align(scratch);
 }
 
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
+/* Taps of the exact Gaussian for the _4c kernels, which take one tap per
+   channel: `sigma` holds one sigma per color channel, and alpha gets the taps
+   of the first. A kernel narrower than the widest of the three is centered
+   and zero-padded, which leaves its sum what it is. Returns the radius;
+   `kw4` takes 4 * (2 * SF_GAUSS_MAX_RADIUS + 1) floats. */
+static int _sf_gauss_kernel4(const float sigma[3],
+                             float *kw4)
+{
+  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
+  int radius = 0;
+  for(int c = 0; c < 3; c++)
+    radius = MAX(radius, dt_gaussian_kernel_1d(sigma[c], kw, SF_GAUSS_MAX_RADIUS));
+  memset(kw4, 0, sizeof(float) * 4 * (2 * radius + 1));
+  for(int c = 0; c < 3; c++)
+  {
+    const int kr = dt_gaussian_kernel_1d(sigma[c], kw, SF_GAUSS_MAX_RADIUS);
+    for(int i = 0; i <= 2 * kr; i++)
+    {
+      kw4[4 * (i + radius - kr) + c] = kw[i];
+      if(c == 0) kw4[4 * (i + radius - kr) + 3] = kw[i];
+    }
+  }
+  return radius;
+}
+
+/* The scatter stage blurs every color channel with its own sigma. One float4
+   pass takes all three, as long as they agree on the method and, for the
+   recursion, on the number of passes: this is 0 for the exact kernel and the
+   number of recursive passes otherwise. */
+static int _sf_blur_rounds(const float sigma)
+{
+  float pass_sigma;
+  return sigma >= SF_GAUSS_EXACT_MAX_SIGMA ? sf_gauss_iir_passes(sigma, &pass_sigma) : 0;
+}
+#endif
+
 #ifdef HAVE_OPENCL
 /* Separable Young-van Vliet pass on the device, the GPU half of
    sf_gauss_yvv_coeffs / _sf_gauss_iir_1d. `tmp` is a scratch buffer of the same
-   shape as `src`; `dst` may be `src`.
+   shape as `src`; `dst` may be `src`. `sigma` holds one sigma per color
+   channel, and all three have to take the same number of passes.
 
    Both paths must run this same recursion: a blur of a different shape produces
    a different halo width for the same sigma, and every spatial radius in the
@@ -2670,27 +2700,37 @@ static cl_int _sf_yvv_blur_cl(const int devid,
                               cl_mem tmp,
                               const int w,
                               const int h,
-                              const float sigma,
-                              const int ch)
+                              const float sigma[3])
 {
-  float b[4];
-  float pass_sigma = sigma;
-  const int passes = sf_gauss_iir_passes(sigma, &pass_sigma);
-  sf_gauss_yvv_coeffs(pass_sigma, b);
-  const int krow = (ch == 4) ? gd->kernel_yvv_row_4c : gd->kernel_yvv_row_1c;
-  const int kcol = (ch == 4) ? gd->kernel_yvv_col_4c : gd->kernel_yvv_col_1c;
+  float B[4], B2[4], B3[4];
+  int passes = 1;
+  for(int c = 0; c < 3; c++)
+  {
+    float b[4];
+    float pass_sigma = sigma[c];
+    passes = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    sf_gauss_yvv_coeffs(pass_sigma, b);
+    B[c] = b[0];
+    B2[c] = b[2];
+    B3[c] = b[3];
+  }
+  B[3] = B[0];
+  B2[3] = B2[0];
+  B3[3] = B3[0];
+  const int krow = gd->kernel_yvv_row_4c;
+  const int kcol = gd->kernel_yvv_col_4c;
   /* the row kernels work on tiles of sizex x sizey items, up to 8 x 16, and
      keep sizey rows of YVV_TILE_PITCH (65) elements in local memory */
   dt_opencl_local_buffer_t locopt
     = (dt_opencl_local_buffer_t){ .xoffset = 65, .xfactor = 0,
                                   .yoffset = 0, .yfactor = 1,
-                                  .cellsize = ch * sizeof(float), .overhead = 0,
+                                  .cellsize = 4 * sizeof(float), .overhead = 0,
                                   .sizex = 8, .sizey = 16 };
   if(dt_opencl_local_buffer_opt(devid, krow, &locopt) != CL_SUCCESS)
     return DT_OPENCL_DEFAULT_ERROR;
   const size_t row_sizes[2] = { locopt.sizex, ROUNDUP(h, locopt.sizey) };
   const size_t row_local[2] = { locopt.sizex, locopt.sizey };
-  const size_t tile_bytes = (size_t)locopt.sizey * 65 * ch * sizeof(float);
+  const size_t tile_bytes = (size_t)locopt.sizey * 65 * 4 * sizeof(float);
   cl_int e = CL_SUCCESS;
   for(int pass = 0; pass < passes && e == CL_SUCCESS; pass++)
   {
@@ -2699,12 +2739,12 @@ static cl_int _sf_yvv_blur_cl(const int devid,
     cl_mem in = pass ? dst : src;
     e = dt_opencl_enqueue_kernel_2d_local_args(devid, krow, row_sizes, row_local,
                                                CLARG(in), CLARG(tmp),
-                                               CLARG(w), CLARG(h), CLARG(b[0]), CLARG(b[2]),
-                                               CLARG(b[3]), CLLOCAL(tile_bytes));
+                                               CLARG(w), CLARG(h), CLARG(B), CLARG(B2),
+                                               CLARG(B3), CLLOCAL(tile_bytes));
     if(e == CL_SUCCESS)
       e = dt_opencl_enqueue_kernel_2d_args(devid, kcol, w, 1, CLARG(tmp), CLARG(dst),
-                                           CLARG(w), CLARG(h), CLARG(b[0]), CLARG(b[2]),
-                                           CLARG(b[3]));
+                                           CLARG(w), CLARG(h), CLARG(B), CLARG(B2),
+                                           CLARG(B3));
     /* a wide sigma runs as many cascaded passes; waiting on each one keeps
        every device submission to a single pass, well inside the driver's
        job timeout, instead of letting the whole cascade queue up as one job */
@@ -2737,13 +2777,13 @@ static cl_int _sf_blur_wide_cl(const int devid,
     return CL_SUCCESS;
   *done = 1;
   float *inv = dt_alloc_align_float((size_t)k + 1);
-  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
-  const int kr = dt_gaussian_kernel_1d(sigma_low, kw, SF_GAUSS_MAX_RADIUS);
+  float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
+  const int kr = _sf_gauss_kernel4((const float[3]){ sigma_low, sigma_low, sigma_low }, kw);
   cl_mem rows = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * lw * h);
   cl_mem low = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * lw * lh);
   cl_mem lowtmp = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * lw * lh);
   cl_mem inv_cl = dt_opencl_alloc_device_buffer(devid, sizeof(float) * (k + 1));
-  cl_mem kw_cl = dt_opencl_alloc_device_buffer(devid, sizeof(float) * (2 * kr + 1));
+  cl_mem kw_cl = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * (2 * kr + 1));
   cl_int e = CL_MEM_OBJECT_ALLOCATION_FAILURE;
   if(inv && rows && low && lowtmp && inv_cl && kw_cl)
   {
@@ -2751,7 +2791,8 @@ static cl_int _sf_blur_wide_cl(const int devid,
     const float inv2k = 1.0f / (float)(2 * k);
     e = dt_opencl_write_buffer_to_device(devid, inv, inv_cl, 0, sizeof(float) * (k + 1), TRUE);
     if(e == CL_SUCCESS)
-      e = dt_opencl_write_buffer_to_device(devid, kw, kw_cl, 0, sizeof(float) * (2 * kr + 1), TRUE);
+      e = dt_opencl_write_buffer_to_device(devid, kw, kw_cl, 0, sizeof(float) * 4 * (2 * kr + 1),
+                                           TRUE);
     if(e == CL_SUCCESS)
       e = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_wide_rows, lw, h, CLARG(src),
                                            CLARG(rows), CLARG(w), CLARG(h), CLARG(k), CLARG(lw),
@@ -2781,6 +2822,63 @@ static cl_int _sf_blur_wide_cl(const int devid,
   if(lowtmp) dt_opencl_release_mem_object(lowtmp);
   if(inv_cl) dt_opencl_release_mem_object(inv_cl);
   if(kw_cl) dt_opencl_release_mem_object(kw_cl);
+  return e;
+}
+
+/* The scatter stage's blur: each color channel of `src` blurred with its own
+   sigma, and `weight` times the result added to `acc`, or stored there with
+   `reset`. `blur` and `tmp` are float4 scratch, `gauss_w` takes the taps.
+   Channels that disagree on _sf_blur_rounds() go in separate rounds; the
+   accumulation of a round weighs the channels of the others with zero. */
+static cl_int _sf_scatter_blur_cl(const int devid,
+                                  dt_iop_spektrafilm_global_data_t *gd,
+                                  cl_mem src,
+                                  cl_mem acc,
+                                  cl_mem blur,
+                                  cl_mem tmp,
+                                  cl_mem gauss_w,
+                                  const int w,
+                                  const int h,
+                                  const float sigma[3],
+                                  const float weight,
+                                  int reset)
+{
+  const int rounds[3] = { _sf_blur_rounds(sigma[0]), _sf_blur_rounds(sigma[1]),
+                          _sf_blur_rounds(sigma[2]) };
+  cl_int e = CL_SUCCESS;
+  for(int c = 0; c < 3 && e == CL_SUCCESS; c++)
+  {
+    if((c > 0 && rounds[0] == rounds[c]) || (c > 1 && rounds[1] == rounds[c])) continue;
+    float sg[3], wt[3];
+    for(int i = 0; i < 3; i++)
+    {
+      const gboolean member = rounds[i] == rounds[c];
+      sg[i] = member ? sigma[i] : sigma[c];
+      wt[i] = member ? weight : 0.0f;
+    }
+    if(rounds[c])
+      e = _sf_yvv_blur_cl(devid, gd, src, blur, tmp, w, h, sg);
+    else
+    {
+      float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
+      const int kr = _sf_gauss_kernel4(sg, kw);
+      e = dt_opencl_write_buffer_to_device(devid, kw, gauss_w, 0,
+                                           sizeof(float) * 4 * (2 * kr + 1), TRUE);
+      if(e == CL_SUCCESS)
+        e = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_row_4c, w, h, CLARG(src),
+                                             CLARG(tmp), CLARG(w), CLARG(h), CLARG(gauss_w),
+                                             CLARG(kr));
+      if(e == CL_SUCCESS)
+        e = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_col_4c, w, h, CLARG(tmp),
+                                             CLARG(blur), CLARG(w), CLARG(h), CLARG(gauss_w),
+                                             CLARG(kr));
+    }
+    if(e == CL_SUCCESS)
+      e = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_diffusion_accum, w, h, CLARG(blur),
+                                           CLARG(acc), CLARG(w), CLARG(h), CLARG(wt[0]),
+                                           CLARG(wt[1]), CLARG(wt[2]), CLARG(reset));
+    reset = 0;
+  }
   return e;
 }
 
@@ -2896,11 +2994,6 @@ int process_cl(dt_iop_module_t *self,
   cl_mem plane2 = dt_opencl_alloc_device_buffer(devid, npix * f * 4);
   cl_mem tmpa = dt_opencl_alloc_device_buffer(devid, npix * f * 4);
   cl_mem acc = dt_opencl_alloc_device_buffer(devid, npix * f * 4);
-  /* single-channel scratch for the scatter stage's genuinely per-channel
-     blurs (spektrafilm_channel_extract + a 1ch Gaussian): 1/4 the size and
-     1/4 the per-blur cost of running the equivalent work on a float4
-     buffer, see the scatter stage below. */
-  cl_mem plane1 = dt_opencl_alloc_device_buffer(devid, npix * f);
   /* row-pass intermediates for the direct (exact) separable convolution
      below: dedicated buffers, distinct from every buffer a blur might be
      called on in place, so the row pass never aliases its own input. */
@@ -2908,9 +3001,10 @@ int process_cl(dt_iop_module_t *self,
   cl_mem gtmp1 = dt_opencl_alloc_device_buffer(devid, npix * f);
   /* kernel weights (2*SF_GAUSS_MAX_RADIUS+1 taps, built host-side by
      dt_gaussian_kernel_1d and rewritten before each blur dispatch below) */
-  cl_mem gauss_w = dt_opencl_alloc_device_buffer(devid, sizeof(float) * (2 * SF_GAUSS_MAX_RADIUS + 1));
+  cl_mem gauss_w
+      = dt_opencl_alloc_device_buffer(devid, sizeof(float) * 4 * (2 * SF_GAUSS_MAX_RADIUS + 1));
   if(!mats_cl || !tc_cl || !cn_cl || !cb_cl || !sl_cl || !sx_cl || !sy_cl || !sz_cl || !sn_cl
-     || !sm_cl || !cm_cl || !plane || !plane2 || !tmpa || !acc || !plane1 || !gtmp4 || !gtmp1
+     || !sm_cl || !cm_cl || !plane || !plane2 || !tmpa || !acc || !gtmp4 || !gtmp1
      || !gauss_w
      || (g->has_print && (!el_cl || !ex_cl || !ey_cl || !ez_cl || !en_cl || !em_cl || !pc_cl)))
   {
@@ -2928,10 +3022,10 @@ int process_cl(dt_iop_module_t *self,
 #define SF_GAUSS_BLUR4(buf, _sg, label) do { \
     if(err == CL_SUCCESS) \
     { \
-      float _kw[2 * SF_GAUSS_MAX_RADIUS + 1]; \
-      const int _kr = dt_gaussian_kernel_1d((_sg), _kw, SF_GAUSS_MAX_RADIUS); \
+      float _kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)]; \
+      const int _kr = _sf_gauss_kernel4((const float[3]){ (_sg), (_sg), (_sg) }, _kw); \
       err = dt_opencl_write_buffer_to_device(devid, _kw, gauss_w, 0, \
-                                             sizeof(float) * (2 * _kr + 1), TRUE); \
+                                             sizeof(float) * 4 * (2 * _kr + 1), TRUE); \
       if(err == CL_SUCCESS) \
         err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_row_4c, w, h, \
                                                CLARG(buf), CLARG(gtmp4), CLARG(w), CLARG(h), \
@@ -2955,13 +3049,14 @@ int process_cl(dt_iop_module_t *self,
     if(err == CL_SUCCESS) \
     { \
       if((_sg) >= SF_GAUSS_EXACT_MAX_SIGMA) \
-        err = _sf_yvv_blur_cl(devid, gd, (buf), (buf), gtmp4, w, h, (_sg), 4); \
+        err = _sf_yvv_blur_cl(devid, gd, (buf), (buf), gtmp4, w, h, \
+                              (const float[3]){ (_sg), (_sg), (_sg) }); \
       else \
       { \
-        float _kw[2 * SF_GAUSS_MAX_RADIUS + 1]; \
-        const int _kr = dt_gaussian_kernel_1d((_sg), _kw, SF_GAUSS_MAX_RADIUS); \
+        float _kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)]; \
+        const int _kr = _sf_gauss_kernel4((const float[3]){ (_sg), (_sg), (_sg) }, _kw); \
         err = dt_opencl_write_buffer_to_device(devid, _kw, gauss_w, 0, \
-                                               sizeof(float) * (2 * _kr + 1), TRUE); \
+                                               sizeof(float) * 4 * (2 * _kr + 1), TRUE); \
         if(err == CL_SUCCESS) \
           err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_row_4c, w, h, \
                                                  CLARG(buf), CLARG(gtmp4), CLARG(w), CLARG(h), \
@@ -2984,13 +3079,14 @@ int process_cl(dt_iop_module_t *self,
     if(err == CL_SUCCESS) \
     { \
       if((_sg) >= SF_GAUSS_EXACT_MAX_SIGMA) \
-        err = _sf_yvv_blur_cl(devid, gd, (src), (dst), gtmp4, w, h, (_sg), 4); \
+        err = _sf_yvv_blur_cl(devid, gd, (src), (dst), gtmp4, w, h, \
+                              (const float[3]){ (_sg), (_sg), (_sg) }); \
       else \
       { \
-        float _kw[2 * SF_GAUSS_MAX_RADIUS + 1]; \
-        const int _kr = dt_gaussian_kernel_1d((_sg), _kw, SF_GAUSS_MAX_RADIUS); \
+        float _kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)]; \
+        const int _kr = _sf_gauss_kernel4((const float[3]){ (_sg), (_sg), (_sg) }, _kw); \
         err = dt_opencl_write_buffer_to_device(devid, _kw, gauss_w, 0, \
-                                               sizeof(float) * (2 * _kr + 1), TRUE); \
+                                               sizeof(float) * 4 * (2 * _kr + 1), TRUE); \
         if(err == CL_SUCCESS) \
           err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_row_4c, w, h, \
                                                  CLARG(src), CLARG(gtmp4), CLARG(w), CLARG(h), \
@@ -3015,14 +3111,10 @@ int process_cl(dt_iop_module_t *self,
     else \
       SF_GAUSS_BLUR4_OP_L(src, dst, _ws); \
   } while(0)
-/* single-channel in-place blur (scatter stage only, on plane1). Same fast
-   fallback above SF_GAUSS_EXACT_MAX_SIGMA -- scatter's core/tail sigmas are
-   normally small (sub-few-px), but the fallback is here for whatever a user's
-   scatter_scale slider can push them to. */
 /* Exact-kernel-only single-channel blur, the GPU twin of sf_blur_plane1():
    that function passes exact_only=1 unconditionally, so its call sites must
-   NOT fall back to the recursive approximation at large sigma the way
-   SF_GAUSS_BLUR1_L below does. Used by the grain dye-cloud blur. */
+   NOT fall back to the recursive approximation at large sigma. Used by the
+   grain dye-cloud blur. */
 #define SF_GAUSS_BLUR1_EXACT(buf, _sg) do { \
     if(err == CL_SUCCESS) \
     { \
@@ -3038,28 +3130,6 @@ int process_cl(dt_iop_module_t *self,
         err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_col_1c, w, h, \
                                                CLARG(gtmp1), CLARG(buf), CLARG(w), CLARG(h), \
                                                CLARG(gauss_w), CLARG(_kr)); \
-    } \
-  } while(0)
-#define SF_GAUSS_BLUR1_L(buf, _sg) do { \
-    if(err == CL_SUCCESS) \
-    { \
-      if((_sg) >= SF_GAUSS_EXACT_MAX_SIGMA) \
-        err = _sf_yvv_blur_cl(devid, gd, (buf), (buf), gtmp1, w, h, (_sg), 1); \
-      else \
-      { \
-        float _kw[2 * SF_GAUSS_MAX_RADIUS + 1]; \
-        const int _kr = dt_gaussian_kernel_1d((_sg), _kw, SF_GAUSS_MAX_RADIUS); \
-        err = dt_opencl_write_buffer_to_device(devid, _kw, gauss_w, 0, \
-                                               sizeof(float) * (2 * _kr + 1), TRUE); \
-        if(err == CL_SUCCESS) \
-          err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_row_1c, w, h, \
-                                                 CLARG(buf), CLARG(gtmp1), CLARG(w), CLARG(h), \
-                                                 CLARG(gauss_w), CLARG(_kr)); \
-        if(err == CL_SUCCESS) \
-          err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_gauss_col_1c, w, h, \
-                                                 CLARG(gtmp1), CLARG(buf), CLARG(w), CLARG(h), \
-                                                 CLARG(gauss_w), CLARG(_kr)); \
-      } \
     } \
   } while(0)
 
@@ -3165,50 +3235,29 @@ int process_cl(dt_iop_module_t *self,
       const float sscl = fmaxf(d->p.scatter_scale, 1e-3f);
       /* per-channel scatter radii (um on film) and tail mixture, identical to
          spektra_core.c's sf_halation() sc_core/sc_tail/tail_amp/tail_rat.
-         Each channel needs its OWN sigma (R/G/B differ): extract that
-         channel into the single-channel scratch buffer plane1, blur it
-         alone (1x the work of a same-size float4 blur, not 4x), then
-         kernel_channel_accum folds it into the target channel of tmpa/acc. */
+         Each channel needs its OWN sigma (R/G/B differ), which
+         _sf_scatter_blur_cl() gives it in float4 passes. */
       /* per-film scatter PSF: cl_sc_core/cl_sc_tail above, clamped in double
          from the sim's own values -- not fminf() on sf_sim_gpu_t's float
          mirrors, which rounds once more than the CPU does. */
       const float amp[3] = { 0.1633f, 0.6496f, 0.1870f }, rat[3] = { 0.5360f, 1.5236f, 2.7684f };
+      float sigma[3];
+      /* CPU: fmaxf((float)(sc_core[c] * scl / pixel_um), 1e-6f) */
       for(int c = 0; c < 3; c++)
+        sigma[c] = fmaxf((float)(cl_sc_core[c] * (double)sscl / (double)pixel_um), 1e-6f);
+      err = _sf_scatter_blur_cl(devid, gd, plane, tmpa, plane2, gtmp4, gauss_w, w, h, sigma,
+                                1.0f, 1);
+      SF_CL_STEP("scatter core blur");
+      for(int g3 = 0; g3 < 3; g3++)
       {
-        err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_channel_extract, w, h,
-                                               CLARG(plane), CLARG(plane1), CLARG(w), CLARG(h),
-                                               CLARG(c));
-        if(err != CL_SUCCESS) break;
-        /* CPU: fmaxf((float)(sc_core[c] * scl / pixel_um), 1e-6f) */
-        SF_GAUSS_BLUR1_L(plane1, fmaxf((float)(cl_sc_core[c] * (double)sscl
-                                               / (double)pixel_um), 1e-6f));
-        if(err != CL_SUCCESS) break;
-        const float core_weight = 1.0f;
-        const int core_reset = (c == 0);
-        err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_channel_accum, w, h,
-                                               CLARG(plane1), CLARG(tmpa), CLARG(w), CLARG(h),
-                                               CLARG(core_weight), CLARG(c), CLARG(core_reset));
-        SF_CL_STEP("scatter core blur");
-      }
-      for(int g3 = 0; g3 < 3 && err == CL_SUCCESS; g3++)
+        /* CPU associates as rat * (tail * scl / pixel_um), in double */
         for(int c = 0; c < 3; c++)
-        {
-          err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_channel_extract, w, h,
-                                                 CLARG(plane), CLARG(plane1), CLARG(w), CLARG(h),
-                                                 CLARG(c));
-          if(err != CL_SUCCESS) break;
-          /* CPU associates as rat * (tail * scl / pixel_um), in double */
-          const float sigma = fmaxf((float)((double)rat[g3]
-                                            * (cl_sc_tail[c] * (double)sscl
-                                               / (double)pixel_um)), 1e-6f);
-          SF_GAUSS_BLUR1_L(plane1, sigma);
-          if(err != CL_SUCCESS) break;
-          const int reset = (g3 == 0 && c == 0);
-          err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_channel_accum, w, h,
-                                                 CLARG(plane1), CLARG(acc), CLARG(w), CLARG(h),
-                                                 CLARG(amp[g3]), CLARG(c), CLARG(reset));
-          SF_CL_STEP("scatter tail accum");
-        }
+          sigma[c] = fmaxf((float)((double)rat[g3]
+                                   * (cl_sc_tail[c] * (double)sscl / (double)pixel_um)), 1e-6f);
+        err = _sf_scatter_blur_cl(devid, gd, plane, acc, plane2, gtmp4, gauss_w, w, h, sigma,
+                                  amp[g3], g3 == 0);
+        SF_CL_STEP("scatter tail accum");
+      }
       /* CPU: sf_halation() rounds the sim's double w_s[] to float once and
          blends with the same fma nesting as spektrafilm_scatter_combine.
          Rounded from the same double here, not read from sf_sim_gpu_t's
@@ -3663,7 +3712,6 @@ cleanup:
   dt_opencl_release_mem_object(plane2);
   dt_opencl_release_mem_object(tmpa);
   dt_opencl_release_mem_object(acc);
-  dt_opencl_release_mem_object(plane1);
   dt_opencl_release_mem_object(gtmp4);
   dt_opencl_release_mem_object(gtmp1);
   dt_opencl_release_mem_object(gauss_w);
@@ -3682,25 +3730,35 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
                               dt_slang_gpu_buffer_t *tmp,
                               const int w,
                               const int h,
-                              const float sigma,
-                              const int ch)
+                              const float sigma[3])
 {
-  float b[4];
-  float pass_sigma = sigma;
-  const int passes = sf_gauss_iir_passes(sigma, &pass_sigma);
-  sf_gauss_yvv_coeffs(pass_sigma, b);
-  const char *krow = (ch == 4) ? "spektrafilm_yvv_row_4c" : "spektrafilm_yvv_row_1c";
-  const char *kcol = (ch == 4) ? "spektrafilm_yvv_col_4c" : "spektrafilm_yvv_col_1c";
+  float B[4], B2[4], B3[4];
+  int passes = 1;
+  for(int c = 0; c < 3; c++)
+  {
+    float b[4];
+    float pass_sigma = sigma[c];
+    passes = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    sf_gauss_yvv_coeffs(pass_sigma, b);
+    B[c] = b[0];
+    B2[c] = b[2];
+    B3[c] = b[3];
+  }
+  B[3] = B[0];
+  B2[3] = B2[0];
+  B3[3] = B3[0];
+  const char *krow = "spektrafilm_yvv_row_4c";
+  const char *kcol = "spektrafilm_yvv_col_4c";
   int err = 0;
   for(int pass = 0; pass < passes && !err; pass++)
   {
     // only the first pass reads the source, as in _sf_yvv_blur_cl()
     dt_slang_gpu_buffer_t *in = pass ? dst : src;
     err = dt_slang_gpu_run_1d_args("spektrafilm", krow, h, SLBUF_DEV(in), SLBUF_DEV(tmp),
-                                   SLARG(w), SLARG(h), SLARG(b[0]), SLARG(b[2]), SLARG(b[3]));
+                                   SLARG(w), SLARG(h), SLARG(B), SLARG(B2), SLARG(B3));
     if(!err)
       err = dt_slang_gpu_run_1d_args("spektrafilm", kcol, w, SLBUF_DEV(tmp), SLBUF_DEV(dst),
-                                     SLARG(w), SLARG(h), SLARG(b[0]), SLARG(b[2]), SLARG(b[3]));
+                                     SLARG(w), SLARG(h), SLARG(B), SLARG(B2), SLARG(B3));
     // one pass per device submission, as in _sf_yvv_blur_cl()
     if(!err && passes > 1) dt_slang_gpu_wait();
   }
@@ -3724,14 +3782,14 @@ static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *src,
     return 0;
   *done = 1;
   float *inv = dt_alloc_align_float((size_t)k + 1);
-  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
-  const int kr = dt_gaussian_kernel_1d(sigma_low, kw, SF_GAUSS_MAX_RADIUS);
+  float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
+  const int kr = _sf_gauss_kernel4((const float[3]){ sigma_low, sigma_low, sigma_low }, kw);
   if(inv) sf_wide_blur_inv_table(k, inv);
   dt_slang_gpu_buffer_t *rows = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * h);
   dt_slang_gpu_buffer_t *low = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * lh);
   dt_slang_gpu_buffer_t *lowtmp = dt_slang_gpu_buffer_new_uninit(sizeof(float) * 4 * lw * lh);
   dt_slang_gpu_buffer_t *inv_dev = inv ? dt_slang_gpu_buffer_new(sizeof(float) * (k + 1), inv) : NULL;
-  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * (2 * kr + 1), kw);
+  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * 4 * (2 * kr + 1), kw);
   int err = 1;
   if(inv && rows && low && lowtmp && inv_dev && kw_dev)
   {
@@ -3768,18 +3826,20 @@ static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *src,
 }
 
 /* the exact separable Gaussian of the SF_GAUSS_BLUR* macros in process_cl():
-   rows of src into tmp, then columns of tmp into dst, which may be src */
-static int _sf_gauss_exact_slang(dt_slang_gpu_buffer_t *src,
-                                 dt_slang_gpu_buffer_t *dst,
-                                 dt_slang_gpu_buffer_t *tmp,
-                                 const int w,
-                                 const int h,
-                                 const float sigma,
-                                 const int ch)
+   rows of src into tmp, then columns of tmp into dst, which may be src.
+   `sigma` holds one sigma per color channel for ch == 4 and one for ch == 1 */
+static int _sf_gauss_exact3_slang(dt_slang_gpu_buffer_t *src,
+                                  dt_slang_gpu_buffer_t *dst,
+                                  dt_slang_gpu_buffer_t *tmp,
+                                  const int w,
+                                  const int h,
+                                  const float *sigma,
+                                  const int ch)
 {
-  float kw[2 * SF_GAUSS_MAX_RADIUS + 1];
-  const int kr = dt_gaussian_kernel_1d(sigma, kw, SF_GAUSS_MAX_RADIUS);
-  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * (2 * kr + 1), kw);
+  float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
+  const int kr = (ch == 4) ? _sf_gauss_kernel4(sigma, kw)
+                           : dt_gaussian_kernel_1d(sigma[0], kw, SF_GAUSS_MAX_RADIUS);
+  dt_slang_gpu_buffer_t *kw_dev = dt_slang_gpu_buffer_new(sizeof(float) * ch * (2 * kr + 1), kw);
   if(!kw_dev) return 1;
   const char *krow = (ch == 4) ? "spektrafilm_gauss_row_4c" : "spektrafilm_gauss_row_1c";
   const char *kcol = (ch == 4) ? "spektrafilm_gauss_col_4c" : "spektrafilm_gauss_col_1c";
@@ -3790,6 +3850,17 @@ static int _sf_gauss_exact_slang(dt_slang_gpu_buffer_t *src,
                                    SLARG(w), SLARG(h), SLBUF_DEV(kw_dev), SLARG(kr));
   dt_slang_gpu_buffer_free(kw_dev);
   return err;
+}
+
+static int _sf_gauss_exact_slang(dt_slang_gpu_buffer_t *src,
+                                 dt_slang_gpu_buffer_t *dst,
+                                 dt_slang_gpu_buffer_t *tmp,
+                                 const int w,
+                                 const int h,
+                                 const float sigma,
+                                 const int ch)
+{
+  return _sf_gauss_exact3_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma }, ch);
 }
 
 static int _sf_copy_slang(dt_slang_gpu_buffer_t *src,
@@ -3810,7 +3881,7 @@ static int _sf_blur4_op_slang(dt_slang_gpu_buffer_t *src,
                               const float sigma)
 {
   if(sigma >= SF_GAUSS_EXACT_MAX_SIGMA)
-    return _sf_yvv_blur_slang(src, dst, tmp, w, h, sigma, 4);
+    return _sf_yvv_blur_slang(src, dst, tmp, w, h, (const float[3]){ sigma, sigma, sigma });
   return _sf_gauss_exact_slang(src, dst, tmp, w, h, sigma, 4);
 }
 
@@ -3832,16 +3903,49 @@ static int _sf_blur4_wide_op_slang(dt_slang_gpu_buffer_t *src,
   return _sf_blur4_op_slang(src, dst, tmp, w, h, sigma);
 }
 
-/* SF_GAUSS_BLUR1_L, and SF_GAUSS_BLUR4_FAST for ch == 4 */
+/* SF_GAUSS_BLUR4_FAST */
 static int _sf_blur_fast_slang(dt_slang_gpu_buffer_t *buf,
                                dt_slang_gpu_buffer_t *tmp,
                                const int w,
                                const int h,
-                               const float sigma,
-                               const int ch)
+                               const float sigma)
 {
-  if(sigma >= SF_GAUSS_EXACT_MAX_SIGMA) return _sf_yvv_blur_slang(buf, buf, tmp, w, h, sigma, ch);
-  return _sf_gauss_exact_slang(buf, buf, tmp, w, h, sigma, ch);
+  return _sf_blur4_op_slang(buf, buf, tmp, w, h, sigma);
+}
+
+/* _sf_scatter_blur_cl() */
+static int _sf_scatter_blur_slang(dt_slang_gpu_buffer_t *src,
+                                  dt_slang_gpu_buffer_t *acc,
+                                  dt_slang_gpu_buffer_t *blur,
+                                  dt_slang_gpu_buffer_t *tmp,
+                                  const int w,
+                                  const int h,
+                                  const float sigma[3],
+                                  const float weight,
+                                  int reset)
+{
+  const int rounds[3] = { _sf_blur_rounds(sigma[0]), _sf_blur_rounds(sigma[1]),
+                          _sf_blur_rounds(sigma[2]) };
+  int err = 0;
+  for(int c = 0; c < 3 && !err; c++)
+  {
+    if((c > 0 && rounds[0] == rounds[c]) || (c > 1 && rounds[1] == rounds[c])) continue;
+    float sg[3], wt[3];
+    for(int i = 0; i < 3; i++)
+    {
+      const gboolean member = rounds[i] == rounds[c];
+      sg[i] = member ? sigma[i] : sigma[c];
+      wt[i] = member ? weight : 0.0f;
+    }
+    err = rounds[c] ? _sf_yvv_blur_slang(src, blur, tmp, w, h, sg)
+                    : _sf_gauss_exact3_slang(src, blur, tmp, w, h, sg, 4);
+    if(!err)
+      err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
+                                     SLBUF_DEV(blur), SLBUF_DEV(acc), SLARG(w), SLARG(h),
+                                     SLARG(wt[0]), SLARG(wt[1]), SLARG(wt[2]), SLARG(reset));
+    reset = 0;
+  }
+  return err;
 }
 
 gboolean process_slang(dt_iop_module_t *self,
@@ -3938,7 +4042,6 @@ gboolean process_slang(dt_iop_module_t *self,
   dt_slang_gpu_buffer_t *plane2 = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
   dt_slang_gpu_buffer_t *tmpa = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
   dt_slang_gpu_buffer_t *acc = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
-  dt_slang_gpu_buffer_t *plane1 = dt_slang_gpu_buffer_new_uninit(npix * f);
   dt_slang_gpu_buffer_t *gtmp4 = dt_slang_gpu_buffer_new_uninit(npix * f * 4);
   dt_slang_gpu_buffer_t *gtmp1 = dt_slang_gpu_buffer_new_uninit(npix * f);
   /* the grain tables, which process_cl() keeps across calls in
@@ -3947,7 +4050,7 @@ gboolean process_slang(dt_iop_module_t *self,
                         *gr_curve = NULL, *gr_acc = NULL;
   dt_slang_gpu_buffer_t *gr_raw[SF_GRAIN_MAX_SUBLAYERS] = { NULL };
   if(!mats_d || !tc_d || !cn_d || !cb_d || !sl_d || !sx_d || !sy_d || !sz_d || !sn_d || !sm_d
-     || !cm_d || !plane || !plane2 || !tmpa || !acc || !plane1 || !gtmp4 || !gtmp1
+     || !cm_d || !plane || !plane2 || !tmpa || !acc || !gtmp4 || !gtmp1
      || (g->has_print && (!el_d || !ex_d || !ey_d || !ez_d || !en_d || !em_d || !pc_d)))
   {
     err = 1;
@@ -4022,41 +4125,19 @@ gboolean process_slang(dt_iop_module_t *self,
     {
       const float sscl = fmaxf(d->p.scatter_scale, 1e-3f);
       const float amp[3] = { 0.1633f, 0.6496f, 0.1870f }, rat[3] = { 0.5360f, 1.5236f, 2.7684f };
+      float sigma[3];
       for(int c = 0; c < 3; c++)
-      {
-        err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_extract", w, h,
-                                       SLBUF_DEV(plane), SLBUF_DEV(plane1), SLARG(w), SLARG(h),
-                                       SLARG(c));
-        if(!err)
-          err = _sf_blur_fast_slang(plane1, gtmp1, w, h,
-                                    fmaxf((float)(sc_core[c] * (double)sscl / (double)pixel_um),
-                                          1e-6f), 1);
-        const float core_weight = 1.0f;
-        const int core_reset = (c == 0);
-        if(!err)
-          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_accum", w, h,
-                                         SLBUF_DEV(plane1), SLBUF_DEV(tmpa), SLARG(w), SLARG(h),
-                                         SLARG(core_weight), SLARG(c), SLARG(core_reset));
-        SF_SL_STEP("scatter core blur");
-      }
+        sigma[c] = fmaxf((float)(sc_core[c] * (double)sscl / (double)pixel_um), 1e-6f);
+      err = _sf_scatter_blur_slang(plane, tmpa, plane2, gtmp4, w, h, sigma, 1.0f, 1);
+      SF_SL_STEP("scatter core blur");
       for(int g3 = 0; g3 < 3; g3++)
+      {
         for(int c = 0; c < 3; c++)
-        {
-          err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_extract", w, h,
-                                         SLBUF_DEV(plane), SLBUF_DEV(plane1), SLARG(w), SLARG(h),
-                                         SLARG(c));
-          const float sigma = fmaxf((float)((double)rat[g3]
-                                            * (sc_tail[c] * (double)sscl / (double)pixel_um)),
-                                    1e-6f);
-          if(!err) err = _sf_blur_fast_slang(plane1, gtmp1, w, h, sigma, 1);
-          const int reset = (g3 == 0 && c == 0);
-          const float a = amp[g3];
-          if(!err)
-            err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_channel_accum", w, h,
-                                           SLBUF_DEV(plane1), SLBUF_DEV(acc), SLARG(w), SLARG(h),
-                                           SLARG(a), SLARG(c), SLARG(reset));
-          SF_SL_STEP("scatter tail accum");
-        }
+          sigma[c] = fmaxf((float)((double)rat[g3]
+                                   * (sc_tail[c] * (double)sscl / (double)pixel_um)), 1e-6f);
+        err = _sf_scatter_blur_slang(plane, acc, plane2, gtmp4, w, h, sigma, amp[g3], g3 == 0);
+        SF_SL_STEP("scatter tail accum");
+      }
       const float ws_r = (float)sc_w[0], ws_g = (float)sc_w[1], ws_b = (float)sc_w[2];
       const float s_amount = CLAMP(d->p.scatter_amount, 0.0f, 1.0f);
       /* `plane` is both the raw input and the output: a per-pixel op */
@@ -4151,7 +4232,7 @@ gboolean process_slang(dt_iop_module_t *self,
       }
       else if(csigma >= SF_GAUSS_MIN_SIGMA)
       {
-        err = _sf_blur_fast_slang(acc, gtmp4, w, h, csigma, 4);
+        err = _sf_blur_fast_slang(acc, gtmp4, w, h, csigma);
         SF_SL_STEP("coupler blur");
       }
     }
@@ -4390,7 +4471,6 @@ cleanup:
   dt_slang_gpu_buffer_free(plane2);
   dt_slang_gpu_buffer_free(tmpa);
   dt_slang_gpu_buffer_free(acc);
-  dt_slang_gpu_buffer_free(plane1);
   dt_slang_gpu_buffer_free(gtmp4);
   dt_slang_gpu_buffer_free(gtmp1);
   dt_slang_gpu_buffer_free(gr_dmax);
