@@ -2688,7 +2688,8 @@ static void _diff_statistics(const dt_iop_module_t *self,
                              float *const dat_b,  // output OpenCL
                              const int ch,
                              const int devid,
-                             const gboolean visualize)
+                             const gboolean visualize,
+                             const float scale)
 {
   const int width = roi->width;
   const int height = roi->height;
@@ -2749,7 +2750,7 @@ static void _diff_statistics(const dt_iop_module_t *self,
       /** We are interested in locations with an error > 2S having a signal above "black".
           As we bypass the data through the pipe we nomalize the dark background.
       */
-      const gboolean relevant = stddev > 1e-10f && ad > 2.0f * stddev && b > 1e-8f;
+      const gboolean relevant = stddev / scale > 1e-10f && ad > 2.0f * stddev && b > 1e-8f;
       const float sigerror = relevant ? MAX(0.0f, ad / stddev - 2.0f)  : 0.0f;
       const float viserror = relevant ? 0.2f * sqrf(0.5f * sigerror) : 0.0f;
       for(int c = 0; c < MIN(ch, 3); c++)
@@ -2772,7 +2773,7 @@ static void _diff_statistics(const dt_iop_module_t *self,
   dt_free_align(errlevel);
   dt_print_pipe(DT_DEBUG_ALWAYS, "OpenCL diff stats", NULL, self, devid, NULL, NULL,
            "(%4dx%4d) max=%.5e %10s  std=%.5e  mean=%+.5e  S2:%7d %4.1f%%   S4:%7d %4.1f%%   S8:%6d %3.1f%%",
-           width, height, max_abs, position, stddev, mean,
+           width, height, max_abs / scale, position, stddev / scale, mean / scale,
            outrange_2, 100.0f * (float)outrange_2 / (float)npix,
            outrange_4, 100.0f * (float)outrange_4 / (float)npix,
            outliers, 100.0f * (float)outliers / (float)npix);
@@ -2827,7 +2828,7 @@ static float *_opencl_dump_diff_pipe_pfm(dt_dev_pixelpipe_t *pipe,
             }
           }
           if(do_diffstat)
-            _diff_statistics(module, roi_out, cpudata, clout, cho, pipe->devid, visualize);
+            _diff_statistics(module, roi_out, cpudata, clout, cho, pipe->devid, visualize, dt_iop_get_processed_maximum(piece));
           if(do_dumpfile)
             dt_dump_pipe_diff_pfm(module->op, clout, cpudata, ow, oh, cho,
                                             dt_dev_pixelpipe_type_to_str(pipe->type));
