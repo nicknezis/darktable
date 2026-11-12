@@ -277,8 +277,10 @@ typedef struct
 // green at the CA shift point of extended sensel i
 static inline float _ca_gint(global const float *green, const int i, const int ewidth, const ca_shift_t s)
 {
-  const float gfloor = mix(green[i + s.vfloor * ewidth + s.hfloor], green[i + s.vfloor * ewidth + s.hceil], s.hfrac);
-  const float gceil = mix(green[i + s.vceil * ewidth + s.hfloor], green[i + s.vceil * ewidth + s.hceil], s.hfrac);
+  const float gfloor = mix(green[i + s.vfloor * ewidth + s.hfloor],
+                           green[i + s.vfloor * ewidth + s.hceil], s.hfrac);
+  const float gceil = mix(green[i + s.vceil * ewidth + s.hfloor],
+                          green[i + s.vceil * ewidth + s.hceil], s.hfrac);
   return mix(gfloor, gceil, s.vfrac);
 }
 
