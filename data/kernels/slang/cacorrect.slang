@@ -36,6 +36,8 @@ import common;
 static const float eps = 1e-5f;
 static const int TILE = 112; // ts - 2 * border in cacorrect.c
 
+float _interpolatef(float a, float b, float c) { return a * (b - c) + c; }
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void cacorrect_load(uint3 gid : SV_DispatchThreadID,
@@ -259,11 +261,11 @@ struct Shift
 // green at the CA shift point of extended sensel i
 float _gint(StructuredBuffer<float> green, int i, int ewidth, Shift s)
 {
-  const float gfloor = lerp(green[i + s.vfloor * ewidth + s.hfloor],
-                            green[i + s.vfloor * ewidth + s.hceil], s.hfrac);
-  const float gceil = lerp(green[i + s.vceil * ewidth + s.hfloor],
-                           green[i + s.vceil * ewidth + s.hceil], s.hfrac);
-  return lerp(gfloor, gceil, s.vfrac);
+  const float gfloor = _interpolatef(s.hfrac, green[i + s.vfloor * ewidth + s.hceil],
+                                     green[i + s.vfloor * ewidth + s.hfloor]);
+  const float gceil = _interpolatef(s.hfrac, green[i + s.vceil * ewidth + s.hceil],
+                                    green[i + s.vceil * ewidth + s.hfloor]);
+  return _interpolatef(s.vfrac, gceil, gfloor);
 }
 
 // the correction pass: red and blue from the colour differences at their
@@ -330,9 +332,9 @@ void cacorrect_correct(uint3 gid : SV_DispatchThreadID,
   const float g = green[i];
   float o = raw[i];
   const float grbdiffold = g - o;
-  const float grbdiffinthfloor = lerp(grbdiff[0], grbdiff[1], hfrac);
-  const float grbdiffinthceil = lerp(grbdiff[2], grbdiff[3], hfrac);
-  float grbdiffint = lerp(grbdiffinthfloor, grbdiffinthceil, vfrac);
+  const float grbdiffinthfloor = _interpolatef(hfrac, grbdiff[1], grbdiff[0]);
+  const float grbdiffinthceil = _interpolatef(hfrac, grbdiff[3], grbdiff[2]);
+  float grbdiffint = _interpolatef(vfrac, grbdiffinthceil, grbdiffinthfloor);
 
   const float RBint = g - grbdiffint;
   if(abs(RBint - o) < 0.25f * (RBint + o))
