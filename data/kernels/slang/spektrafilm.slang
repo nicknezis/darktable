@@ -786,34 +786,102 @@ void spektrafilm_passthrough(uint3 gid : SV_DispatchThreadID,
 
 // ---- spatial-effect kernels ----------------------------------------------------
 
-// Young-van Vliet recursion, one work item per line, dispatched with
-// dt_slang_gpu_run_1d_args()
+// Young-van Vliet recursion over rows, one work item per row: a work group
+// of 16 x 16 items runs 256 consecutive rows, dispatched with
+// dt_slang_gpu_run_1d_args() over h. Reading the image itself, every step of
+// the recursion would touch one cache line and one page per row. On a 40 MP
+// image that thrashes the caches, and the pass took 7x as long as at 10 MP.
+// So the group loads YVV_ROW_CHUNK columns of its rows into group memory
+// together, each item runs its own row's recursion there, and the group
+// stores the chunk again.
+static const int YVV_ROW_CHUNK = 4;
+static const int YVV_ROW_PITCH = YVV_ROW_CHUNK + 1;
+groupshared float4 yvv_rows[256 * YVV_ROW_PITCH];
+
+// n <= YVV_ROW_CHUNK columns from c0 on of the group's rows, into or out of
+// group memory; item `flat` moves every 256th element
+void _yvv_rows_load(StructuredBuffer<float4> src, int row0, int w, int h, int c0, int n, int flat)
+{
+  for(int k = 0; k < YVV_ROW_CHUNK; k++)
+  {
+    const int i = flat + k * 256;
+    const int r = i / YVV_ROW_CHUNK, c = i % YVV_ROW_CHUNK;
+    if(c < n && row0 + r < h) yvv_rows[r * YVV_ROW_PITCH + c] = src[(row0 + r) * w + c0 + c];
+  }
+}
+
+void _yvv_rows_reload(RWStructuredBuffer<float4> src, int row0, int w, int h, int c0, int n, int flat)
+{
+  for(int k = 0; k < YVV_ROW_CHUNK; k++)
+  {
+    const int i = flat + k * 256;
+    const int r = i / YVV_ROW_CHUNK, c = i % YVV_ROW_CHUNK;
+    if(c < n && row0 + r < h) yvv_rows[r * YVV_ROW_PITCH + c] = src[(row0 + r) * w + c0 + c];
+  }
+}
+
+void _yvv_rows_store(RWStructuredBuffer<float4> dst, int row0, int w, int h, int c0, int n, int flat)
+{
+  for(int k = 0; k < YVV_ROW_CHUNK; k++)
+  {
+    const int i = flat + k * 256;
+    const int r = i / YVV_ROW_CHUNK, c = i % YVV_ROW_CHUNK;
+    if(c < n && row0 + r < h) dst[(row0 + r) * w + c0 + c] = yvv_rows[r * YVV_ROW_PITCH + c];
+  }
+}
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID,
+void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
                             uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
                             uniform int w, uniform int h, uniform float4 B, uniform float4 B2, uniform float4 B3)
 {
-  const int row = gid.y * 16 + gid.x;
-  if(row >= h) return;
-  const int o = row * w;
-  float4 w1 = src[o], w2 = src[o], w3 = src[o];
-  for(int j = 0; j < w; j++)
+  const int flat = int(lid.y) * 16 + int(lid.x);
+  const int row0 = (int(gid.y) - int(lid.y)) * 16;
+  const int row = row0 + flat;
+  const bool valid = row < h;
+  const int t = flat * YVV_ROW_PITCH;
+  const int last = ((w - 1) / YVV_ROW_CHUNK) * YVV_ROW_CHUNK;
+
+  float4 w1 = src[min(row, h - 1) * w], w2 = w1, w3 = w1;
+  for(int c0 = 0; c0 < w; c0 += YVV_ROW_CHUNK)
   {
-    const float4 v = w1 + fma(B, src[o + j] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
-    dst[o + j] = v;
-    w3 = w2;
-    w2 = w1;
-    w1 = v;
+    const int n = min(YVV_ROW_CHUNK, w - c0);
+    _yvv_rows_load(src, row0, w, h, c0, n, flat);
+    GroupMemoryBarrierWithGroupSync();
+    if(valid)
+      for(int j = 0; j < n; j++)
+      {
+        const float4 v = w1 + fma(B, yvv_rows[t + j] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
+        yvv_rows[t + j] = v;
+        w3 = w2;
+        w2 = w1;
+        w1 = v;
+      }
+    GroupMemoryBarrierWithGroupSync();
+    _yvv_rows_store(dst, row0, w, h, c0, n, flat);
+    GroupMemoryBarrierWithGroupSync();
   }
-  float4 v1 = dst[o + w - 1], v2 = v1, v3 = v1;
-  for(int j = w - 1; j >= 0; j--)
+
+  // w1 holds dst[row * w + w - 1]
+  float4 v1 = w1, v2 = v1, v3 = v1;
+  for(int c0 = last; c0 >= 0; c0 -= YVV_ROW_CHUNK)
   {
-    const float4 v = v1 + fma(B, dst[o + j] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
-    dst[o + j] = v;
-    v3 = v2;
-    v2 = v1;
-    v1 = v;
+    const int n = min(YVV_ROW_CHUNK, w - c0);
+    _yvv_rows_reload(dst, row0, w, h, c0, n, flat);
+    GroupMemoryBarrierWithGroupSync();
+    if(valid)
+      for(int j = n - 1; j >= 0; j--)
+      {
+        const float4 v = v1 + fma(B, yvv_rows[t + j] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
+        yvv_rows[t + j] = v;
+        v3 = v2;
+        v2 = v1;
+        v1 = v;
+      }
+    GroupMemoryBarrierWithGroupSync();
+    _yvv_rows_store(dst, row0, w, h, c0, n, flat);
+    GroupMemoryBarrierWithGroupSync();
   }
 }
 
