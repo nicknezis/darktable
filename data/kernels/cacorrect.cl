@@ -36,16 +36,6 @@
 #define CA_EPS 1e-5f
 #define CA_TILE 112 // ts - 2 * border in cacorrect.c
 
-static inline float _ca_sqrf(const float x)
-{
-  return x * x;
-}
-
-static inline float _ca_interpolatef(const float a, const float b, const float c)
-{
-  return a * (b - c) + c;
-}
-
 kernel void
 cacorrect_load(read_only image2d_t in,
                global float *out,
@@ -142,18 +132,18 @@ cacorrect_green(global const float *raw,
   const int v1 = ewidth;
   const int v2 = 2 * ewidth;
   const int v3 = 3 * ewidth;
-  const float wtu = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i + v1] - raw[i - v1])
-                                            + fabs(raw[i] - raw[i - v2])
-                                            + fabs(raw[i - v1] - raw[i - v3])));
-  const float wtd = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i - v1] - raw[i + v1])
-                                            + fabs(raw[i] - raw[i + v2])
-                                            + fabs(raw[i + v1] - raw[i + v3])));
-  const float wtl = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i + 1] - raw[i - 1])
-                                            + fabs(raw[i] - raw[i - 2])
-                                            + fabs(raw[i - 1] - raw[i - 3])));
-  const float wtr = fp32_div(1.0f, _ca_sqrf(CA_EPS + fabs(raw[i - 1] - raw[i + 1])
-                                            + fabs(raw[i] - raw[i + 2])
-                                            + fabs(raw[i + 1] - raw[i + 3])));
+  const float wtu = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i + v1] - raw[i - v1])
+                                           + fabs(raw[i] - raw[i - v2])
+                                           + fabs(raw[i - v1] - raw[i - v3])));
+  const float wtd = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i - v1] - raw[i + v1])
+                                           + fabs(raw[i] - raw[i + v2])
+                                           + fabs(raw[i + v1] - raw[i + v3])));
+  const float wtl = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i + 1] - raw[i - 1])
+                                           + fabs(raw[i] - raw[i - 2])
+                                           + fabs(raw[i - 1] - raw[i - 3])));
+  const float wtr = fp32_div(1.0f, fsquare(CA_EPS + fabs(raw[i - 1] - raw[i + 1])
+                                           + fabs(raw[i] - raw[i + 2])
+                                           + fabs(raw[i + 1] - raw[i + 3])));
   green[i] = fp32_div(wtu * raw[i - v1] + wtd * raw[i + v1] + wtl * raw[i - 1] + wtr * raw[i + 1],
                       wtu + wtd + wtl + wtr);
 }
@@ -287,11 +277,11 @@ typedef struct
 // green at the CA shift point of extended sensel i
 static inline float _ca_gint(global const float *green, const int i, const int ewidth, const ca_shift_t s)
 {
-  const float gfloor = _ca_interpolatef(s.hfrac, green[i + s.vfloor * ewidth + s.hceil],
-                                        green[i + s.vfloor * ewidth + s.hfloor]);
-  const float gceil = _ca_interpolatef(s.hfrac, green[i + s.vceil * ewidth + s.hceil],
-                                       green[i + s.vceil * ewidth + s.hfloor]);
-  return _ca_interpolatef(s.vfrac, gceil, gfloor);
+  const float gfloor = mix(green[i + s.vfloor * ewidth + s.hfloor],
+                           green[i + s.vfloor * ewidth + s.hceil], s.hfrac);
+  const float gceil = mix(green[i + s.vceil * ewidth + s.hfloor],
+                          green[i + s.vceil * ewidth + s.hceil], s.hfrac);
+  return mix(gfloor, gceil, s.vfrac);
 }
 
 // the correction pass: red and blue from the color differences at their
@@ -362,9 +352,9 @@ cacorrect_correct(global const float *raw,
   const float g = green[i];
   float o = raw[i];
   const float grbdiffold = g - o;
-  const float grbdiffinthfloor = _ca_interpolatef(hfrac, grbdiff[1], grbdiff[0]);
-  const float grbdiffinthceil = _ca_interpolatef(hfrac, grbdiff[3], grbdiff[2]);
-  float grbdiffint = _ca_interpolatef(vfrac, grbdiffinthceil, grbdiffinthfloor);
+  const float grbdiffinthfloor = mix(grbdiff[0], grbdiff[1], hfrac);
+  const float grbdiffinthceil = mix(grbdiff[2], grbdiff[3], hfrac);
+  float grbdiffint = mix(grbdiffinthfloor, grbdiffinthceil, vfrac);
 
   const float RBint = g - grbdiffint;
   if(fabs(RBint - o) < 0.25f * (RBint + o))
