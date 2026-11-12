@@ -2374,6 +2374,18 @@ static gboolean _slang_possible(dt_dev_pixelpipe_t *pipe,
     && !(darktable.dump_pfm_pipe && _is_debug_pipe(pipe));
 }
 
+static void _slang_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                    dt_iop_module_t *module,
+                                    dt_dev_pixelpipe_iop_t *piece,
+                                    const void *raw_in,
+                                    dt_slang_gpu_image_t *dev_in,
+                                    dt_slang_gpu_image_t *dev_out,
+                                    void *output,
+                                    const dt_iop_roi_t *roi_in,
+                                    const dt_iop_roi_t *roi_out,
+                                    const int ch_in,
+                                    const int ch_out);
+
 static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
                                        dt_develop_t *dev,
                                        void *input,
@@ -2568,6 +2580,9 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
         ? !process_tiling_slang_fast(piece, dev_in, dev_module, roi_in, sizeof(float) * ch_in,
                                      sizeof(float) * ch_out, tiling, strip_avail)
         : module->process_slang(module, piece, dev_in, dev_module, roi_in, roi_out));
+  if(ok)
+    _slang_diff_against_cpu(pipe, module, piece, raw_u16 ? input : NULL, dev_in, dev_module, *output,
+                            roi_in, roi_out, ch_in, ch_out);
   if(ok && blending)
     ok = dt_develop_blend_process_slang(module, piece, dev_in, dev_module, dev_out, roi_in, roi_out);
   if(blending) dt_slang_gpu_image_free(dev_module);
@@ -2681,7 +2696,9 @@ static cl_int _opencl_benchmark(dt_dev_pixelpipe_t *pipe,
   darktable.unmuted = old_muted;
   return err;
 }
+#endif // HAVE_OPENCL
 
+#if defined(HAVE_OPENCL) || defined(HAVE_SLANG_GPU)
 static void _diff_statistics(const dt_iop_module_t *self,
                              const dt_iop_roi_t *roi,
                              const float *const dat_a,  // output CPU
@@ -2689,7 +2706,8 @@ static void _diff_statistics(const dt_iop_module_t *self,
                              const int ch,
                              const int devid,
                              const gboolean visualize,
-                             const float scale)
+                             const float scale,
+                             const char *label)
 {
   const int width = roi->width;
   const int height = roi->height;
@@ -2771,7 +2789,7 @@ static void _diff_statistics(const dt_iop_module_t *self,
 
   dt_free_align(errpos);
   dt_free_align(errlevel);
-  dt_print_pipe(DT_DEBUG_ALWAYS, "OpenCL diff stats", NULL, self, devid, NULL, NULL,
+  dt_print_pipe(DT_DEBUG_ALWAYS, label, NULL, self, devid, NULL, NULL,
            "(%4dx%4d) max=%.5e %10s  std=%.5e  mean=%+.5e  S2:%7d %4.1f%%   S4:%7d %4.1f%%   S8:%6d %3.1f%%",
            width, height, max_abs / scale, position, stddev / scale, mean / scale,
            outrange_2, 100.0f * (float)outrange_2 / (float)npix,
@@ -2779,6 +2797,122 @@ static void _diff_statistics(const dt_iop_module_t *self,
            outliers, 100.0f * (float)outliers / (float)npix);
 }
 
+static gboolean _gpu_diff_dumpfile(const dt_iop_module_t *module)
+{
+  return dt_str_commasubstring(darktable.dump_diff_pipe, module->op)
+         || dt_str_commasubstring(darktable.dump_diff_pipe, "complete");
+}
+
+// runs the module's CPU process() on the input a GPU path processed and
+// compares the output with gpu_out, which shows the error afterwards if
+// visualize is set
+static void _gpu_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                  dt_iop_module_t *module,
+                                  dt_dev_pixelpipe_iop_t *piece,
+                                  const void *cpu_in,
+                                  float *gpu_out,
+                                  const dt_iop_roi_t *roi_in,
+                                  const dt_iop_roi_t *roi_out,
+                                  const int cho,
+                                  const int cst,
+                                  const gboolean do_diffstat,
+                                  const gboolean do_dumpfile,
+                                  const gboolean visualize,
+                                  const int devid,
+                                  const char *label)
+{
+  const int ow = roi_out->width;
+  const int oh = roi_out->height;
+  float *cpudata = dt_alloc_align_float((size_t)ow * oh * cho);
+  if(!cpudata) return;
+
+  // exposure, temperature and colorin scale pipe->dsc.processed_maximum in
+  // their GPU code already; scaling it again here would change the scale
+  // below and what every later module sees
+  const dt_iop_buffer_dsc_t dsc = pipe->dsc;
+  module->process(module, piece, cpu_in, cpudata, roi_in, roi_out);
+  pipe->dsc = dsc;
+
+  if(cst == IOP_CS_LAB)
+  {
+    for(size_t k = 0; k < (size_t)ow * oh * cho; k+=cho)
+    {
+      dt_aligned_pixel_t XYZ;
+      dt_Lab_to_XYZ(cpudata + k, XYZ);
+      dt_XYZ_to_linearRGB(XYZ, cpudata + k);
+      dt_Lab_to_XYZ(gpu_out + k, XYZ);
+      dt_XYZ_to_linearRGB(XYZ, gpu_out + k);
+    }
+  }
+  if(do_diffstat)
+    _diff_statistics(module, roi_out, cpudata, gpu_out, cho, devid, visualize,
+                     dt_iop_get_processed_maximum(piece), label);
+  if(do_dumpfile)
+    dt_dump_pipe_diff_pfm(module->op, gpu_out, cpudata, ow, oh, cho,
+                                    dt_dev_pixelpipe_type_to_str(pipe->type));
+  if(do_diffstat && visualize && cst == IOP_CS_LAB)
+  {
+    for(size_t k = 0; k < (size_t)ow * oh * cho; k+=cho)
+    {
+      dt_aligned_pixel_t XYZ;
+      dt_linearRGB_to_XYZ(gpu_out + k, XYZ);
+      dt_XYZ_to_Lab(XYZ, gpu_out + k);
+    }
+  }
+  dt_free_align(cpudata);
+}
+#endif // HAVE_OPENCL || HAVE_SLANG_GPU
+
+#ifdef HAVE_SLANG_GPU
+// --opencl-diffstat and --dump-diff-pipe for process_slang(), compared before
+// blending as on OpenCL. A raw input is taken from the host because the device
+// holds it as float.
+static void _slang_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                    dt_iop_module_t *module,
+                                    dt_dev_pixelpipe_iop_t *piece,
+                                    const void *raw_in,
+                                    dt_slang_gpu_image_t *dev_in,
+                                    dt_slang_gpu_image_t *dev_out,
+                                    void *output,
+                                    const dt_iop_roi_t *roi_in,
+                                    const dt_iop_roi_t *roi_out,
+                                    const int ch_in,
+                                    const int ch_out)
+{
+  if(!(darktable.dump_diff_pipe || darktable.cldiff_stats)
+     || !_is_debug_pipe(pipe)
+     || ((module->flags() & IOP_FLAGS_HIDDEN) && (darktable.unmuted & DT_DEBUG_VERBOSE) == 0)
+     || pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE)
+    return;
+
+  const gboolean do_diffstat = darktable.cldiff_stats;
+  const gboolean do_dumpfile = _gpu_diff_dumpfile(module);
+  if(!do_diffstat && !do_dumpfile) return;
+
+  const gboolean visualize = do_diffstat && dt_pipe_is_full(pipe) && dt_iop_has_focus(module);
+  float *gpu_out = dt_alloc_align_float((size_t)roi_out->width * roi_out->height * ch_out);
+  float *host_in = raw_in ? NULL : dt_alloc_align_float((size_t)roi_in->width * roi_in->height * ch_in);
+  if(gpu_out && (raw_in || host_in)
+     && !dt_slang_gpu_image_read(dev_out, gpu_out)
+     && (raw_in || !dt_slang_gpu_image_read(dev_in, host_in)))
+  {
+    _gpu_diff_against_cpu(pipe, module, piece, raw_in ? raw_in : host_in, gpu_out, roi_in, roi_out,
+                          ch_out, module->output_colorspace(module, pipe, piece),
+                          do_diffstat, do_dumpfile, visualize, DT_DEVICE_NONE, "Slang diff stats");
+    // the later modules pass the error image through, and it must not be
+    // cached as this module's output
+    if(visualize && !dt_slang_gpu_image_write(dev_out, gpu_out))
+    {
+      dt_dev_pixelpipe_invalidate_cacheline(pipe, output, NULL);
+      pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+    }
+  }
+  dt_free_align(host_in);
+  dt_free_align(gpu_out);
+}
+#endif // HAVE_SLANG_GPU
+
+#ifdef HAVE_OPENCL
 static float *_opencl_dump_diff_pipe_pfm(dt_dev_pixelpipe_t *pipe,
                                        dt_iop_module_t *module,
                                        dt_dev_pixelpipe_iop_t *piece,
@@ -2795,8 +2929,7 @@ static float *_opencl_dump_diff_pipe_pfm(dt_dev_pixelpipe_t *pipe,
   const gboolean do_diffstat = darktable.cldiff_stats && (cho == 1 || cho == 4);
   const gboolean do_dumpfile = (ch == 4 || ch == 16 || ch == 2) // input supports 1/4 channel floats and 1ch uint16
                             && (cho == 1 || cho == 4)           // output for 1/4 channel floats
-                            && (dt_str_commasubstring(darktable.dump_diff_pipe, module->op)
-                              || dt_str_commasubstring(darktable.dump_diff_pipe, "complete"));
+                            && _gpu_diff_dumpfile(module);
   float *clout = NULL;
   if(do_diffstat || do_dumpfile)
   {
@@ -2806,45 +2939,11 @@ static float *_opencl_dump_diff_pipe_pfm(dt_dev_pixelpipe_t *pipe,
     const int ih = roi_in->height;
     float *clin = dt_alloc_aligned((size_t)iw * ih * ch);
     clout = dt_alloc_align_float((size_t)ow * oh * cho);
-    float *cpudata = dt_alloc_align_float((size_t)ow * oh * cho);
-    if(clin && clout && cpudata)
-    {
-      cl_int err = dt_opencl_copy_image_to_host(pipe->devid, clout, out, ow, oh, cho * sizeof(float));
-      if(err == CL_SUCCESS)
-      {
-        err = dt_opencl_copy_image_to_host(pipe->devid, clin, in, iw, ih, ch);
-        if(err == CL_SUCCESS)
-        {
-          module->process(module, piece, clin, cpudata, roi_in, roi_out);
-          if(cst == IOP_CS_LAB)
-          {
-            for(size_t k = 0; k < (size_t)ow * oh * cho; k+=cho)
-            {
-              dt_aligned_pixel_t XYZ;
-              dt_Lab_to_XYZ(cpudata + k, XYZ);
-              dt_XYZ_to_linearRGB(XYZ, cpudata + k);
-              dt_Lab_to_XYZ(clout + k, XYZ);
-              dt_XYZ_to_linearRGB(XYZ, clout + k);
-            }
-          }
-          if(do_diffstat)
-            _diff_statistics(module, roi_out, cpudata, clout, cho, pipe->devid, visualize, dt_iop_get_processed_maximum(piece));
-          if(do_dumpfile)
-            dt_dump_pipe_diff_pfm(module->op, clout, cpudata, ow, oh, cho,
-                                            dt_dev_pixelpipe_type_to_str(pipe->type));
-          if(do_diffstat && visualize && cst == IOP_CS_LAB)
-          {
-            for(size_t k = 0; k < (size_t)ow * oh * cho; k+=cho)
-            {
-              dt_aligned_pixel_t XYZ;
-              dt_linearRGB_to_XYZ(clout + k, XYZ);
-              dt_XYZ_to_Lab(XYZ, clout + k);
-            }
-          }
-        }
-      }
-    }
-    dt_free_align(cpudata);
+    if(clin && clout
+       && dt_opencl_copy_image_to_host(pipe->devid, clout, out, ow, oh, cho * sizeof(float)) == CL_SUCCESS
+       && dt_opencl_copy_image_to_host(pipe->devid, clin, in, iw, ih, ch) == CL_SUCCESS)
+      _gpu_diff_against_cpu(pipe, module, piece, clin, clout, roi_in, roi_out, cho, cst,
+                            do_diffstat, do_dumpfile, visualize, pipe->devid, "OpenCL diff stats");
     dt_free_align(clin);
   }
   return clout;
