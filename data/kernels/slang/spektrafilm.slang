@@ -786,34 +786,75 @@ void spektrafilm_passthrough(uint3 gid : SV_DispatchThreadID,
 
 // ---- spatial-effect kernels ----------------------------------------------------
 
-// Young-van Vliet recursion, one work item per line, dispatched with
-// dt_slang_gpu_run_1d_args()
+// Young-van Vliet recursion over rows. A work group of 16 x 16 items covers
+// 16 rows and walks them in chunks of YVV_CHUNK columns: the 16 items of a
+// row load a chunk into group memory and store it again, and item 0 runs the
+// serial recursion on it in between. With one item per row reading the image
+// itself, neighboring items read addresses a whole row apart at every step,
+// and the recursion waits on each of those reads. Dispatched with
+// dt_slang_gpu_run_2d_args() over 16 x h. See spektrafilm_yvv_row_4c in
+// spektrafilm.cl, which does the same.
+static const int YVV_CHUNK = 32;
+groupshared float4 yvv_tile[16][YVV_CHUNK];
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID,
+void spektrafilm_yvv_row_4c(uint3 gid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID,
                             uniform StructuredBuffer<float4> src, uniform RWStructuredBuffer<float4> dst,
                             uniform int w, uniform int h, uniform float4 B, uniform float4 B2, uniform float4 B3)
 {
-  const int row = gid.y * 16 + gid.x;
-  if(row >= h) return;
-  const int o = row * w;
-  float4 w1 = src[o], w2 = src[o], w3 = src[o];
-  for(int j = 0; j < w; j++)
+  const int lx = lid.x, ly = lid.y;
+  const bool valid = gid.y < h;
+  const int o = min(int(gid.y), h - 1) * w;
+  const int last = ((w - 1) / YVV_CHUNK) * YVV_CHUNK;
+
+  float4 w1 = src[o], w2 = w1, w3 = w1;
+  for(int c0 = 0; c0 < w; c0 += YVV_CHUNK)
   {
-    const float4 v = w1 + fma(B, src[o + j] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
-    dst[o + j] = v;
-    w3 = w2;
-    w2 = w1;
-    w1 = v;
+    const int n = min(YVV_CHUNK, w - c0);
+    if(valid)
+      for(int j = lx; j < n; j += 16) yvv_tile[ly][j] = src[o + c0 + j];
+    GroupMemoryBarrierWithGroupSync();
+    if(valid && lx == 0)
+    {
+      for(int j = 0; j < n; j++)
+      {
+        const float4 v = w1 + fma(B, yvv_tile[ly][j] - w1, fma(B2, w2 - w1, B3 * (w3 - w1)));
+        yvv_tile[ly][j] = v;
+        w3 = w2;
+        w2 = w1;
+        w1 = v;
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if(valid)
+      for(int j = lx; j < n; j += 16) dst[o + c0 + j] = yvv_tile[ly][j];
+    GroupMemoryBarrierWithGroupSync();
   }
-  float4 v1 = dst[o + w - 1], v2 = v1, v3 = v1;
-  for(int j = w - 1; j >= 0; j--)
+
+  // w1 holds dst[o + w - 1]
+  float4 v1 = w1, v2 = v1, v3 = v1;
+  for(int c0 = last; c0 >= 0; c0 -= YVV_CHUNK)
   {
-    const float4 v = v1 + fma(B, dst[o + j] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
-    dst[o + j] = v;
-    v3 = v2;
-    v2 = v1;
-    v1 = v;
+    const int n = min(YVV_CHUNK, w - c0);
+    if(valid)
+      for(int j = lx; j < n; j += 16) yvv_tile[ly][j] = dst[o + c0 + j];
+    GroupMemoryBarrierWithGroupSync();
+    if(valid && lx == 0)
+    {
+      for(int j = n - 1; j >= 0; j--)
+      {
+        const float4 v = v1 + fma(B, yvv_tile[ly][j] - v1, fma(B2, v2 - v1, B3 * (v3 - v1)));
+        yvv_tile[ly][j] = v;
+        v3 = v2;
+        v2 = v1;
+        v1 = v;
+      }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if(valid)
+      for(int j = lx; j < n; j += 16) dst[o + c0 + j] = yvv_tile[ly][j];
+    GroupMemoryBarrierWithGroupSync();
   }
 }
 

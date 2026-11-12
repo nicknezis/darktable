@@ -3814,7 +3814,8 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
   {
     // only the first pass reads the source, as in _sf_yvv_blur_cl()
     dt_slang_gpu_buffer_t *in = pass ? dst : src;
-    err = dt_slang_gpu_run_1d_args("spektrafilm", krow, h, SLBUF_DEV(in), SLBUF_DEV(tmp),
+    // 16 items per row, see spektrafilm_yvv_row_4c
+    err = dt_slang_gpu_run_2d_args("spektrafilm", krow, 16, h, SLBUF_DEV(in), SLBUF_DEV(tmp),
                                    SLARG(w), SLARG(h), SLARG(B), SLARG(B2), SLARG(B3));
     if(!err && acc && pass == passes - 1)
       err = dt_slang_gpu_run_1d_args("spektrafilm", "spektrafilm_yvv_col_4c_accum", w,
