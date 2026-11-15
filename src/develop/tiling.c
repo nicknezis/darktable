@@ -1816,7 +1816,7 @@ int process_tiling_cl_fast(dt_dev_pixelpipe_iop_t *piece,
     // earlier. A shorter tile leaves rows of the previous tile below its
     // roi, which kernels reading past the roi through a clamping sampler
     // took for the bottom of the image
-    const int first_in = MIN(MAX(0, group - border), height - tile_height);
+    const int first_in = CLAMP(group - border, 0, height - tile_height);
     const int last_in = first_in + tile_height;
     const int t_rows = tile_height;
     const int first_out = group - first_in;
