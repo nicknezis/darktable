@@ -1758,6 +1758,20 @@ static float *_blend_transform_buffer(const dt_dev_pixelpipe_t *pipe,
   return copy;
 }
 
+#ifdef HAVE_SLANG_GPU
+static void _host_tiled_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                         dt_iop_module_t *module,
+                                         dt_dev_pixelpipe_iop_t *piece,
+                                         const void *input,
+                                         void *output,
+                                         const dt_iop_roi_t *roi_in,
+                                         const dt_iop_roi_t *roi_out,
+                                         const size_t in_bpp,
+                                         const size_t out_bpp,
+                                         const int devid,
+                                         const char *label);
+#endif
+
 static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                                           dt_develop_t *dev,
                                           float *input,
@@ -1875,7 +1889,10 @@ static gboolean _pixelpipe_process_on_CPU(dt_dev_pixelpipe_t *pipe,
                   cst_to != cst_out ? " -> " : "",
                   cst_to != cst_out ? dt_iop_colorspace_to_name(cst_out) : "");
     tiled_on_slang = !default_process_tiling_slang(module, piece, tmp, *output, roi_in, roi_out, in_bpp);
-    if(!tiled_on_slang)
+    if(tiled_on_slang)
+      _host_tiled_diff_against_cpu(pipe, module, piece, tmp, *output, roi_in, roi_out, in_bpp, bpp,
+                                   DT_DEVICE_NONE, "Slang diff stats");
+    else
       dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "slang fallback",
                     pipe, module, DT_DEVICE_NONE, roi_in, roi_out, "running on the CPU");
   }
@@ -2860,6 +2877,51 @@ static void _gpu_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
     }
   }
   dt_free_align(cpudata);
+}
+
+// --opencl-diffstat and --dump-diff-pipe for the host-side tiling, which
+// leaves input and output on the host. in_bpp is the input's bytes per pixel
+static void _host_tiled_diff_against_cpu(dt_dev_pixelpipe_t *pipe,
+                                         dt_iop_module_t *module,
+                                         dt_dev_pixelpipe_iop_t *piece,
+                                         const void *input,
+                                         void *output,
+                                         const dt_iop_roi_t *roi_in,
+                                         const dt_iop_roi_t *roi_out,
+                                         const size_t in_bpp,
+                                         const size_t out_bpp,
+                                         const int devid,
+                                         const char *label)
+{
+  if(!(darktable.dump_diff_pipe || darktable.cldiff_stats)
+     || !_is_debug_pipe(pipe)
+     || ((module->flags() & IOP_FLAGS_HIDDEN) && (darktable.unmuted & DT_DEBUG_VERBOSE) == 0)
+     || pipe->mask_display != DT_DEV_PIXELPIPE_DISPLAY_NONE)
+    return;
+
+  const int cho = out_bpp / sizeof(float);
+  const gboolean do_diffstat = darktable.cldiff_stats && (cho == 1 || cho == 4);
+  const gboolean do_dumpfile = (in_bpp == 4 || in_bpp == 16 || in_bpp == 2)
+                            && (cho == 1 || cho == 4)
+                            && _gpu_diff_dumpfile(module);
+  if(!do_diffstat && !do_dumpfile) return;
+
+  const gboolean visualize = do_diffstat && dt_pipe_is_full(pipe) && dt_iop_has_focus(module);
+  const size_t nfloats = (size_t)roi_out->width * roi_out->height * cho;
+  float *gpu_out = dt_alloc_align_float(nfloats);
+  if(!gpu_out) return;
+
+  dt_iop_image_copy(gpu_out, output, nfloats);
+  _gpu_diff_against_cpu(pipe, module, piece, input, gpu_out, roi_in, roi_out, cho,
+                        module->output_colorspace(module, pipe, piece),
+                        do_diffstat, do_dumpfile, visualize, devid, label);
+  if(visualize)
+  {
+    dt_iop_image_copy(output, gpu_out, nfloats);
+    dt_dev_pixelpipe_invalidate_cacheline(pipe, output, NULL);
+    pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+  }
+  dt_free_align(gpu_out);
 }
 #endif // HAVE_OPENCL || HAVE_SLANG_GPU
 
@@ -3942,6 +4004,9 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
                           "device=%i (%s), %s",
                           pipe->devid, darktable.opencl->dev[pipe->devid].cname,
                           cl_errstr(err));
+          else
+            _host_tiled_diff_against_cpu(pipe, module, piece, tmp, *output, &roi_in, roi_out,
+                                         in_bpp, out_bpp, pipe->devid, "OpenCL diff stats");
 
           pixelpipe_flow |= (PIXELPIPE_FLOW_PROCESSED_ON_GPU
                              | PIXELPIPE_FLOW_PROCESSED_WITH_TILING);
