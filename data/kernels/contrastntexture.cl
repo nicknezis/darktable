@@ -78,13 +78,13 @@ kernel void contrastntexture_details(global float *const log_luminance,
   const float log_pixel = log_luminance[k];
   const float2 m = moments[k];
   const float variance = fmax(m.y - m.x * m.x, 0.0f);
-  const float a = variance / (variance + feathering);
+  const float a = fp32_div(variance, variance + feathering);
   const float log_smoothed = a * log_pixel + (1.0f - a) * (m.x + center);
   const float smoothed = dtcl_exp2(log_smoothed);
 
   const float noise_power = noise_bias * noise_bias;
   const float combined_power = smoothed * smoothed;
-  const float wiener_gain = fmax(combined_power - noise_power, 0.0f) / fmax(combined_power, NORM_MIN);
+  const float wiener_gain = fp32_div(fmax(combined_power - noise_power, 0.0f), fmax(combined_power, NORM_MIN));
   const float detail = gain * (wiener_gain * clamp(log_pixel - log_smoothed, -5.0f, 5.0f));
   corrections[k] = accumulate ? corrections[k] + detail : detail;
 
