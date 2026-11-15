@@ -2720,7 +2720,9 @@ static cl_int _sf_yvv_blur_cl(const int devid,
   {
     float b[4];
     float pass_sigma = sigma[c];
-    passes = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    const int n = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    if(c > 0 && n != passes) return DT_OPENCL_DEFAULT_ERROR;
+    passes = n;
     sf_gauss_yvv_coeffs(pass_sigma, b);
     B[c] = b[0];
     B2[c] = b[2];
@@ -2774,9 +2776,9 @@ static cl_int _sf_yvv_blur_cl(const int devid,
 
 /* Device half of sf_blur_plane3_wide(): a float4 w*h buffer `src` into
    `dst`, which may be `src`.
-   Sets *done and returns the error when sf_wide_blur_plan() decimates;
-   leaves *done at 0 and does nothing otherwise, so the caller runs its own
-   blur. */
+   Only for sigmas that sf_wide_blur_plan() decimates, which is all of them
+   from SF_WIDE_BLUR_MIN_SIGMA up: fails on any other, as `dst` would be left
+   unwritten. */
 static cl_int _sf_blur_wide_cl(const int devid,
                                dt_iop_spektrafilm_global_data_t *gd,
                                cl_mem src,
@@ -2785,15 +2787,12 @@ static cl_int _sf_blur_wide_cl(const int devid,
                                const int h,
                                const int roi_x,
                                const int roi_y,
-                               const float sigma,
-                               int *const done)
+                               const float sigma)
 {
   int k, lw, lh, ox, oy;
   float sigma_low;
-  *done = 0;
   if(!sf_wide_blur_plan(sigma, w, h, roi_x, roi_y, &k, &sigma_low, &lw, &lh, &ox, &oy))
-    return CL_SUCCESS;
-  *done = 1;
+    return DT_OPENCL_DEFAULT_ERROR;
   float *inv = dt_alloc_align_float((size_t)k + 1);
   float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
   const int kr = _sf_gauss_kernel4((const float[3]){ sigma_low, sigma_low, sigma_low }, kw);
@@ -2861,7 +2860,10 @@ static cl_int _sf_blur_accum_cl(const int devid,
                                 const float wt[3],
                                 const int reset)
 {
-  if(_sf_blur_rounds(sigma[0]))
+  const int rounds = _sf_blur_rounds(sigma[0]);
+  if(_sf_blur_rounds(sigma[1]) != rounds || _sf_blur_rounds(sigma[2]) != rounds)
+    return DT_OPENCL_DEFAULT_ERROR;
+  if(rounds)
     return _sf_yvv_blur_cl(devid, gd, src, blur, tmp, w, h, sigma, acc, wt, reset);
   float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
   const int kr = _sf_gauss_kernel4(sigma, kw);
@@ -2937,8 +2939,7 @@ static cl_int _sf_diffusion_term_cl(const int devid,
   if(sigma < SF_WIDE_BLUR_EFFECT_SIGMA)
     return _sf_blur_accum_cl(devid, gd, src, acc, blur, tmp, gauss_w, w, h,
                              (const float[3]){ sigma, sigma, sigma }, wt, reset);
-  int wide = 0;
-  cl_int e = _sf_blur_wide_cl(devid, gd, src, blur, w, h, roi_x, roi_y, sigma, &wide);
+  cl_int e = _sf_blur_wide_cl(devid, gd, src, blur, w, h, roi_x, roi_y, sigma);
   if(e == CL_SUCCESS)
     e = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_diffusion_accum, w, h, CLARG(blur),
                                          CLARG(acc), CLARG(w), CLARG(h), CLARG(wt[0]),
@@ -3168,10 +3169,7 @@ int process_cl(dt_iop_module_t *self,
 #define SF_BLUR4_WIDE_OP_L(src, dst, _sg) do { \
     const float _ws = (_sg); \
     if(err == CL_SUCCESS && _ws >= SF_WIDE_BLUR_EFFECT_SIGMA) \
-    { \
-      int _wide = 0; \
-      err = _sf_blur_wide_cl(devid, gd, (src), (dst), w, h, roi_in->x, roi_in->y, _ws, &_wide); \
-    } \
+      err = _sf_blur_wide_cl(devid, gd, (src), (dst), w, h, roi_in->x, roi_in->y, _ws); \
     else \
       SF_GAUSS_BLUR4_OP_L(src, dst, _ws); \
   } while(0)
@@ -3354,7 +3352,7 @@ int process_cl(dt_iop_module_t *self,
         SF_BLUR4_WIDE_OP_L(plane, plane2,
                            fmaxf((float)((cl_hal_sigma_um * (double)hscl
                                           / (double)pixel_um) * sqrt((double)k)), 1e-6f));
-        if(err != CL_SUCCESS) break;
+        SF_CL_STEP("halation bounce blur");
         const int reset = (k == 1);
         err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_accum, w, h, CLARG(plane2),
                                                CLARG(acc), CLARG(w), CLARG(h), CLARG(dec[k - 1]),
@@ -3429,15 +3427,13 @@ int process_cl(dt_iop_module_t *self,
         }
         if(sig[g3] >= SF_WIDE_BLUR_MIN_SIGMA)
         {
-          int wide = 0;
-          err = _sf_blur_wide_cl(devid, gd, acc, plane2, w, h, roi_in->x, roi_in->y, sig[g3],
-                                 &wide);
-          if(err != CL_SUCCESS) break;
+          err = _sf_blur_wide_cl(devid, gd, acc, plane2, w, h, roi_in->x, roi_in->y, sig[g3]);
+          SF_CL_STEP("coupler tail blur");
         }
         else
         {
           err = dt_opencl_enqueue_copy_buffer_to_buffer(devid, acc, plane2, 0, 0, npix * f * 4);
-          if(err != CL_SUCCESS) break;
+          SF_CL_STEP("coupler tail copy");
         }
         err = dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_diffusion_accum, w, h,
                                                CLARG(plane2), CLARG(tmpa), CLARG(w), CLARG(h),
@@ -3454,8 +3450,7 @@ int process_cl(dt_iop_module_t *self,
          cuts here. */
       if(csigma >= SF_WIDE_BLUR_MIN_SIGMA)
       {
-        int wide = 0;
-        err = _sf_blur_wide_cl(devid, gd, acc, acc, w, h, roi_in->x, roi_in->y, csigma, &wide);
+        err = _sf_blur_wide_cl(devid, gd, acc, acc, w, h, roi_in->x, roi_in->y, csigma);
         SF_CL_STEP("coupler blur");
       }
       else if(csigma >= SF_GAUSS_MIN_SIGMA)
@@ -3798,7 +3793,9 @@ static int _sf_yvv_blur_slang(dt_slang_gpu_buffer_t *src,
   {
     float b[4];
     float pass_sigma = sigma[c];
-    passes = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    const int n = sf_gauss_iir_passes(sigma[c], &pass_sigma);
+    if(c > 0 && n != passes) return 1;
+    passes = n;
     sf_gauss_yvv_coeffs(pass_sigma, b);
     B[c] = b[0];
     B2[c] = b[2];
@@ -3837,15 +3834,12 @@ static int _sf_blur_wide_slang(dt_slang_gpu_buffer_t *src,
                                const int h,
                                const int roi_x,
                                const int roi_y,
-                               const float sigma,
-                               int *const done)
+                               const float sigma)
 {
   int k, lw, lh, ox, oy;
   float sigma_low;
-  *done = 0;
   if(!sf_wide_blur_plan(sigma, w, h, roi_x, roi_y, &k, &sigma_low, &lw, &lh, &ox, &oy))
-    return 0;
-  *done = 1;
+    return 1;
   float *inv = dt_alloc_align_float((size_t)k + 1);
   float kw[4 * (2 * SF_GAUSS_MAX_RADIUS + 1)];
   const int kr = _sf_gauss_kernel4((const float[3]){ sigma_low, sigma_low, sigma_low }, kw);
@@ -3972,8 +3966,7 @@ static int _sf_blur4_wide_op_slang(dt_slang_gpu_buffer_t *src,
 {
   if(sigma >= SF_WIDE_BLUR_EFFECT_SIGMA)
   {
-    int wide = 0;
-    return _sf_blur_wide_slang(src, dst, w, h, roi_x, roi_y, sigma, &wide);
+    return _sf_blur_wide_slang(src, dst, w, h, roi_x, roi_y, sigma);
   }
   return _sf_blur4_op_slang(src, dst, tmp, w, h, sigma);
 }
@@ -3999,7 +3992,9 @@ static int _sf_blur_accum_slang(dt_slang_gpu_buffer_t *src,
                                 const float wt[3],
                                 const int reset)
 {
-  if(_sf_blur_rounds(sigma[0]))
+  const int rounds = _sf_blur_rounds(sigma[0]);
+  if(_sf_blur_rounds(sigma[1]) != rounds || _sf_blur_rounds(sigma[2]) != rounds) return 1;
+  if(rounds)
     return _sf_yvv_blur_slang(src, blur, tmp, w, h, sigma, acc, wt, reset);
   return _sf_gauss_exact3_slang(src, acc, tmp, w, h, sigma, 4, wt, reset);
 }
@@ -4052,8 +4047,7 @@ static int _sf_diffusion_term_slang(dt_slang_gpu_buffer_t *src,
   if(sigma < SF_WIDE_BLUR_EFFECT_SIGMA)
     return _sf_blur_accum_slang(src, acc, blur, tmp, w, h,
                                 (const float[3]){ sigma, sigma, sigma }, wt, reset);
-  int wide = 0;
-  int err = _sf_blur_wide_slang(src, blur, w, h, roi_x, roi_y, sigma, &wide);
+  int err = _sf_blur_wide_slang(src, blur, w, h, roi_x, roi_y, sigma);
   if(!err)
     err = dt_slang_gpu_run_2d_args("spektrafilm", "spektrafilm_diffusion_accum", w, h,
                                    SLBUF_DEV(blur), SLBUF_DEV(acc), SLARG(w), SLARG(h),
@@ -4324,8 +4318,7 @@ gboolean process_slang(dt_iop_module_t *self,
         }
         if(sig[g3] >= SF_WIDE_BLUR_MIN_SIGMA)
         {
-          int wide = 0;
-          err = _sf_blur_wide_slang(acc, plane2, w, h, roi_x, roi_y, sig[g3], &wide);
+          err = _sf_blur_wide_slang(acc, plane2, w, h, roi_x, roi_y, sig[g3]);
         }
         else
           err = _sf_copy_slang(acc, plane2, w, h);
@@ -4340,8 +4333,7 @@ gboolean process_slang(dt_iop_module_t *self,
     {
       if(csigma >= SF_WIDE_BLUR_MIN_SIGMA)
       {
-        int wide = 0;
-        err = _sf_blur_wide_slang(acc, acc, w, h, roi_x, roi_y, csigma, &wide);
+        err = _sf_blur_wide_slang(acc, acc, w, h, roi_x, roi_y, csigma);
         SF_SL_STEP("coupler blur");
       }
       else if(csigma >= SF_GAUSS_MIN_SIGMA)
