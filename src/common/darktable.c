@@ -2661,9 +2661,12 @@ int dt_init(int argc,
         dt_control_crawler_start_background();
     }
 
-    // show the main window and restore its geometry to that saved in the config file
-    gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
+    // restore the saved geometry before showing the main window, so that it
+    // is mapped already maximized: on macOS, maximizing the mapped window
+    // after resizing it to the saved size leaves it drawn at the wrong scale
+    // until the user resizes it
     dt_gui_gtk_load_config();
+    gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
     dt_gui_process_events();
     dt_splash_screen_destroy();
     dt_welcome_screen_run_if_needed();
