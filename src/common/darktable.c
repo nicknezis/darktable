@@ -2666,8 +2666,11 @@ int dt_init(int argc,
     // after resizing it to the saved size leaves it drawn at the wrong scale
     // until the user resizes it
     dt_gui_gtk_load_config();
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after load_config"); }
     gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after show_all"); }
     dt_gui_process_events();
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after process_events"); }
     dt_splash_screen_destroy();
     dt_welcome_screen_run_if_needed();
     dt_colorspaces_notify_retired_selection();
