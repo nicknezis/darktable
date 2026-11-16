@@ -2061,6 +2061,46 @@ error:
 #endif
 
 #ifdef HAVE_SLANG_GPU
+// debug only: DT_SLANG_MK_STATS=1 prints sums of each Markesteijn buffer
+static void _mk_stats(const char *step, const int idx, dt_slang_gpu_buffer_t *buf,
+                      const int comps, const gboolean is_uint, const int width, const int height)
+{
+  if(!buf || !getenv("DT_SLANG_MK_STATS")) return;
+  const size_t n = (size_t)width * height * comps;
+  float *h = dt_alloc_align_float(n);
+  if(!h) return;
+  if(dt_slang_gpu_buffer_read(buf, h, n * sizeof(float))) { dt_free_align(h); return; }
+  double sum[4] = { 0.0 }, sq[4] = { 0.0 };
+  size_t nonfinite = 0;
+  const uint32_t *u = (const uint32_t *)h;
+  // only the interior: the borders are left unwritten on purpose
+  for(int y = 24; y < height - 24; y++)
+    for(int x = 24; x < width - 24; x++)
+      for(int c = 0; c < comps; c++)
+      {
+        const size_t i = ((size_t)y * width + x) * comps + c;
+        if(!is_uint && !isfinite(h[i])) { nonfinite++; continue; }
+        const double v = is_uint ? (double)u[i] : (double)h[i];
+        sum[c] += v;
+        sq[c] += v * v;
+      }
+  // a few fixed sample pixels, to compare values directly
+  char samples[512] = { 0 };
+  size_t off = 0;
+  for(int k = 1; k <= 8; k++)
+  {
+    const size_t px = (size_t)(height * k / 9) * width + (size_t)(width * k / 9) + k;
+    for(int c = 0; c < comps && off < sizeof(samples) - 24; c++)
+      off += snprintf(samples + off, sizeof(samples) - off, " %.9g",
+                      is_uint ? (double)u[px * comps + c] : (double)h[px * comps + c]);
+    if(off < sizeof(samples) - 2) samples[off++] = '|';
+  }
+  fprintf(stderr, "[mkstats] %-26s %d", step, idx);
+  for(int c = 0; c < comps; c++) fprintf(stderr, " s%d=%.12e q%d=%.12e", c, sum[c], c, sq[c]);
+  fprintf(stderr, " nonfinite=%zu samples:%s\n", nonfinite, samples);
+  dt_free_align(h);
+}
+
 // Markesteijn as in process_markesteijn_cl(), on full X-Trans data. Returns
 // TRUE on success
 static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
@@ -2160,11 +2200,13 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
   const int pad_g1_g3 = PAD_G1_G3;
   MRUN("markesteijn_green_minmax", SLIMG_DEV(dev_in), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
        SLARG(pad_g1_g3), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+  _mk_stats("green_minmax", 0, gminmax, 2, FALSE, width, height);
 
   const int pad_g_interp = PAD_G_INTERP;
   MRUN("markesteijn_initial_green", SLIMG_DEV(dev_in), SLBUF_DEV(rgb[0]), SLBUF_DEV(rgb[1]),
        SLBUF_DEV(rgb[2]), SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height),
        SLARG(pad_g_interp), SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
+  for(int c = 0; c < 4; c++) _mk_stats("initial_green", c, rgb[c], 4, FALSE, width, height);
 
   // the solitary green pixels are every third one from sgreen on
   const int sg_width = (width - sgreen[0] + 2) / 3;
@@ -2186,6 +2228,7 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
            SLBUF_DEV(rgb[3]), SLBUF_DEV(gminmax), SLARG(width), SLARG(height), SLARG(pad_g_recalc),
            SLARG(sgreen), SLBUF(xtrans, 36), SLBUF(allhex, sizeof(allhex)));
     }
+    if(pass) for(int c = 0; c < 4; c++) _mk_stats("recalculate_green", pass * 10 + c, rgb[c], 4, FALSE, width, height);
 
     const int pad_rb_g = (passes == 1) ? 6 : 5;
     dt_slang_gpu_buffer_t **trgb = rgb;
@@ -2199,31 +2242,37 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
                                        SLBUF(xtrans, 36));
       if((d < 2) || (d & 1)) trgb++;
     }
+    for(int c = 0; c < 4; c++) _mk_stats("solitary_green", pass * 10 + c, rgb[c], 4, FALSE, width, height);
 
     const int pad_rb_br = (passes == 1) ? 6 : 5;
     for(int d = 0; d < 4; d++)
       MRUN("markesteijn_red_and_blue", SLBUF_DEV(rgb[d]), SLARG(width), SLARG(height), SLARG(pad_rb_br),
            SLARG(d), SLARG(sgreen), SLBUF(xtrans, 36));
+    for(int c = 0; c < 4; c++) _mk_stats("red_and_blue", pass * 10 + c, rgb[c], 4, FALSE, width, height);
 
     const int pad_g22 = (passes == 1) ? 8 : 4;
     for(int d = 0, n = 0; d < ndir; d += 2, n++)
       MRUN("markesteijn_interpolate_twoxtwo", SLBUF_DEV(rgb[n]), SLARG(width), SLARG(height), SLARG(pad_g22),
            SLARG(d), SLARG(sgreen), SLBUF(allhex, sizeof(allhex)));
   }
+  for(int c = 0; c < ndir; c++) _mk_stats("twoxtwo_all_passes", c, rgbv[c], 4, FALSE, width, height);
 
   // convert to perceptual colorspace and differentiate in all directions
   const int pad_yuv = (passes == 1) ? 8 : 13;
   for(int d = 0; d < ndir; d++)
     MRUN("markesteijn_differentiate", SLBUF_DEV(rgbv[d]), SLBUF_DEV(drv[d]), SLARG(width), SLARG(height),
          SLARG(pad_yuv), SLARG(d));
+  for(int c = 0; c < ndir; c++) _mk_stats("differentiate", c, drv[c], 1, FALSE, width, height);
 
   // the homogeneity maps and their 5x5 sums
   const int pad_homo = (passes == 1) ? 10 : 15;
   MRUN("markesteijn_homo_set", SLBUF_DEV(drv8[0]), SLBUF_DEV(drv8[1]), SLBUF_DEV(drv8[2]), SLBUF_DEV(drv8[3]),
        SLBUF_DEV(drv8[4]), SLBUF_DEV(drv8[5]), SLBUF_DEV(drv8[6]), SLBUF_DEV(drv8[7]), SLBUF_DEV(homo2[0]),
        SLBUF_DEV(homo2[1]), SLARG(width), SLARG(height), SLARG(pad_homo), SLARG(ndir));
+  for(int c = 0; c < ndir / 4; c++) _mk_stats("homo_set", c, homo[c], 1, TRUE, width, height);
   MRUN("markesteijn_homo_sum", SLBUF_DEV(homo2[0]), SLBUF_DEV(homo2[1]), SLBUF_DEV(homosum2[0]),
        SLBUF_DEV(homosum2[1]), SLARG(width), SLARG(height), SLARG(pad_tile), SLARG(ndir));
+  for(int c = 0; c < ndir / 4; c++) _mk_stats("homo_sum", c, homosum[c], 1, TRUE, width, height);
 
   // average the most homogeneous directions into the inner part of dev_out,
   // which leaves the border from VNG alone
