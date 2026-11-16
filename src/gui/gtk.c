@@ -1233,6 +1233,30 @@ gboolean _valid_window_placement(const gint saved_x,
   return FALSE;
 }
 
+
+void dt_gui_debug_layout(const char *where)
+{
+  if(!darktable.gui || !darktable.gui->ui || !darktable.gui->ui->main_window) return;
+  GtkWidget *w = darktable.gui->ui->main_window;
+  gint ww = 0, wh = 0, x = 0, y = 0;
+  gtk_window_get_size(GTK_WINDOW(w), &ww, &wh);
+  gtk_window_get_position(GTK_WINDOW(w), &x, &y);
+  GdkWindow *gw = gtk_widget_get_window(w);
+  const int st = gw ? gdk_window_get_state(gw) : -1;
+  GtkAllocation wa, ca, b, l, r, t;
+  gtk_widget_get_allocation(w, &wa);
+  gtk_widget_get_allocation(dt_ui_center(darktable.gui->ui), &ca);
+  gtk_widget_get_allocation(darktable.gui->ui->panels[DT_UI_PANEL_BOTTOM], &b);
+  gtk_widget_get_allocation(darktable.gui->ui->panels[DT_UI_PANEL_LEFT], &l);
+  gtk_widget_get_allocation(darktable.gui->ui->panels[DT_UI_PANEL_RIGHT], &r);
+  gtk_widget_get_allocation(darktable.gui->ui->panels[DT_UI_PANEL_TOP], &t);
+  fprintf(stderr, "[layout-dbg] %-22s t=%.3f win size=%dx%d pos=%d,%d alloc=%dx%d state=0x%x"
+          " center=%dx%d@%d,%d top=%dx%d bottom=%dx%d@%d left=%d right=%d dpi=%.1f ppd=%.1f\n",
+          where, dt_get_wtime(), ww, wh, x, y, wa.width, wa.height, st,
+          ca.width, ca.height, ca.x, ca.y, t.width, t.height, b.width, b.height, b.y,
+          l.width, r.width, darktable.gui->dpi, darktable.gui->ppd);
+}
+
 int dt_gui_gtk_load_config()
 {
   GtkWidget *widget = dt_ui_main_window(darktable.gui->ui);
@@ -1644,6 +1668,7 @@ static gboolean _configure(GtkWidget *da,
   dt_configure_ppd_dpi((dt_gui_gtk_t *) user_data);
 #endif
 
+  fprintf(stderr, "[layout-dbg] center configure-event %dx%d\n", event->width, event->height);
   return dt_control_configure(da, event, user_data);
 }
 
@@ -1709,6 +1734,8 @@ static gboolean _window_configure(GtkWidget *da,
   static int oldx = 0;
   static int oldy = 0;
 
+  fprintf(stderr, "[layout-dbg] window configure-event %dx%d@%d,%d\n", event->configure.width, event->configure.height, event->configure.x, event->configure.y);
+  dt_gui_debug_layout("window configure");
   // the window may have been resized, not just moved
   _enforce_center_width();
 
@@ -2380,8 +2407,17 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
   return 0;
 }
 
+static gboolean _dbg_layout_timeout(gpointer data)
+{
+  dt_gui_debug_layout((const char *)data);
+  return G_SOURCE_REMOVE;
+}
+
 void dt_gui_gtk_run(dt_gui_gtk_t *gui)
 {
+  dt_gui_debug_layout("gtk_run start");
+  g_timeout_add(2000, _dbg_layout_timeout, "2s after run");
+  g_timeout_add(6000, _dbg_layout_timeout, "6s after run");
   GtkWidget *widget = dt_ui_center(darktable.gui->ui);
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
