@@ -2663,8 +2663,11 @@ int dt_init(int argc,
 
     // show the main window and restore its geometry to that saved in the config file
     gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after show_all"); }
     dt_gui_gtk_load_config();
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after load_config"); }
     dt_gui_process_events();
+    { extern void dt_gui_debug_layout(const char *); dt_gui_debug_layout("after process_events"); }
     dt_splash_screen_destroy();
     dt_welcome_screen_run_if_needed();
     dt_colorspaces_notify_retired_selection();
