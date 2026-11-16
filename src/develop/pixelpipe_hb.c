@@ -2484,7 +2484,10 @@ static int _pixelpipe_process_on_slang(dt_dev_pixelpipe_t *pipe,
       const size_t pooled = dt_slang_gpu_pooled_memory();
       const size_t unpooled = available > full + pooled ? available - full - pooled : 0;
       const size_t enough = per_line * MAX((size_t)8 * tiling->overlap, (size_t)roi_in->height / 8);
-      strip_avail = MIN(strip_avail, MAX(unpooled, enough));
+      // A/B experiment: DT_SLANG_STRIPS_LIKE_OPENCL sizes the strips from
+      // all the memory left, as process_tiling_cl_fast() does
+      if(!g_getenv("DT_SLANG_STRIPS_LIKE_OPENCL"))
+        strip_avail = MIN(strip_avail, MAX(unpooled, enough));
       const int64_t lines = strip_avail / per_line;
       const int64_t valid = lines - 2 * tiling->overlap;
       fast_tiling = valid > 0 && valid > lines / 5;

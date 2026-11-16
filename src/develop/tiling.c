@@ -1949,7 +1949,9 @@ int process_tiling_slang_fast(dt_dev_pixelpipe_iop_t *piece,
   const int align = MAX(tiling->align, 1);
   const int border = tiling->overlap;
   // factor_cl counts the module's input and output among its images
-  const size_t per_line = (size_t)MAX(ibpp, obpp) * width * MAX(tiling->factor_cl, 1.0f);
+  const size_t per_line = g_getenv("DT_SLANG_STRIPS_LIKE_OPENCL")
+    ? (size_t)(ibpp + obpp) * width * MAX(tiling->factor, 1.0f)
+    : (size_t)MAX(ibpp, obpp) * width * MAX(tiling->factor_cl, 1.0f);
   // every strip has the same height, so the last one starts earlier: the
   // modules size their kernels from the roi, not from the images
   const int strip = MIN(_align_down((int)MIN(avail / per_line, (size_t)INT_MAX), align), height);
