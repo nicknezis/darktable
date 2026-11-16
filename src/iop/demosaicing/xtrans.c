@@ -2101,6 +2101,72 @@ static void _mk_stats(const char *step, const int idx, dt_slang_gpu_buffer_t *bu
   dt_free_align(h);
 }
 
+// debug only: replays markesteijn_solitary_green() on the host in double
+// precision and counts the pixels where the GPU result differs
+static void _mk_check_solitary(const float *rgb_in, const float *aux_in, const float *rgb_out,
+                               const float *aux_out, const uint8_t (*const xtrans)[6],
+                               const int width, const int height, const int border, const int d,
+                               const int dir[2], const int hcomp, const int sgreen[2])
+{
+  size_t total = 0, bad = 0, bad_tie = 0, bad_choice = 0;
+  int shown = 0;
+  for(int y = sgreen[1]; y < height; y += 3)
+    for(int x = sgreen[0]; x < width; x += 3)
+    {
+      if(x < border || x >= width - border || y < border || y >= height - border) continue;
+      total++;
+      const size_t gl = (size_t)y * width + x;
+      int h = xtrans[(y + 600) % 6][(x + 1 + 600) % 6] ^ hcomp;
+      double color[4] = { 0.0 }, ocolor[4] = { 0.0 };
+      if(d > 0)
+        for(int c = 0; c < 4; c++) ocolor[c] = color[c] = aux_in[4 * gl + c];
+      double diff = 0.0;
+      const float *ctr = rgb_in + 4 * gl;
+      for(int c = 0; c < 2; c++, h ^= 2)
+      {
+        const int k = 1 << c;
+        const float *pp = rgb_in + 4 * ((size_t)(y + k * dir[1]) * width + x + k * dir[0]);
+        const float *pm = rgb_in + 4 * ((size_t)(y - k * dir[1]) * width + x - k * dir[0]);
+        const double g = 2.0 * ctr[1] - pp[1] - pm[1];
+        color[h] = g + pp[h] + pm[h];
+        if(d > 1)
+          diff += (pp[1] - pm[1] - pp[h] + pm[h]) * (double)(pp[1] - pm[1] - pp[h] + pm[h]) + g * g;
+      }
+      color[3] = diff;
+      const gboolean choose = (d > 1) && (d & 1);
+      double margin = 0.0;
+      if(choose)
+      {
+        margin = fabs(ocolor[3] - diff) / fmax(fmax(fabs(ocolor[3]), fabs(diff)), 1e-30);
+        for(int c = 0; c < 2; c++) color[c * 2] = (ocolor[3] < diff) ? ocolor[c * 2] : color[c * 2];
+      }
+      gboolean wrong = FALSE;
+      for(int c = 0; c < 4; c++)
+        if(fabs(aux_out[4 * gl + c] - color[c]) > 1e-5 * fmax(fabs(color[c]), 1e-3)) wrong = TRUE;
+      if((d < 2) || (d & 1))
+        for(int c = 0; c < 3; c += 2)
+          if(fabs(rgb_out[4 * gl + c] - color[c] / 2.0) > 1e-5 * fmax(fabs(color[c]), 1e-3)) wrong = TRUE;
+      if(!wrong) continue;
+      bad++;
+      if(choose && margin < 1e-5) bad_tie++;
+      // would the other choice have matched?
+      if(choose)
+      {
+        const double alt0 = (ocolor[3] < diff) ? color[0] : ocolor[0];
+        if(fabs(aux_out[4 * gl] - alt0) <= 1e-5 * fmax(fabs(alt0), 1e-3)) bad_choice++;
+      }
+      if(shown < 4)
+      {
+        shown++;
+        fprintf(stderr, "[mkcheck]   d=%d (%d,%d) gpu aux %.9g %.9g %.9g %.9g host %.9g %.9g %.9g %.9g ocolor3 %.9g margin %.3g\n",
+                d, x, y, aux_out[4 * gl], aux_out[4 * gl + 1], aux_out[4 * gl + 2], aux_out[4 * gl + 3],
+                color[0], color[1], color[2], color[3], ocolor[3], margin);
+      }
+    }
+  fprintf(stderr, "[mkcheck] solitary_green d=%d pixels=%zu wrong=%zu near_tie=%zu other_choice_matches=%zu\n",
+          d, total, bad, bad_tie, bad_choice);
+}
+
 // Markesteijn as in process_markesteijn_cl(), on full X-Trans data. Returns
 // TRUE on success
 static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
@@ -2235,11 +2301,32 @@ static gboolean process_markesteijn_slang(dt_dev_pixelpipe_iop_t *piece,
     for(int d = 0, i = 1, h = 0; d < 6; d++, i ^= 1, h ^= 2)
     {
       const int dir[2] = { i, i ^ 1 };
+      const gboolean check = ok && getenv("DT_SLANG_MK_STATS");
+      float *c_rgb = NULL, *c_aux = NULL, *c_rgb2 = NULL, *c_aux2 = NULL;
+      if(check)
+      {
+        c_rgb = dt_alloc_align_float(4 * npix);
+        c_aux = dt_alloc_align_float(4 * npix);
+        c_rgb2 = dt_alloc_align_float(4 * npix);
+        c_aux2 = dt_alloc_align_float(4 * npix);
+        dt_slang_gpu_buffer_read(trgb[0], c_rgb, sizeof(float) * 4 * npix);
+        dt_slang_gpu_buffer_read(aux, c_aux, sizeof(float) * 4 * npix);
+      }
       if(ok)
         ok = !dt_slang_gpu_run_2d_args(prg, "markesteijn_solitary_green", sg_width, sg_height,
                                        SLBUF_DEV(trgb[0]), SLBUF_DEV(aux), SLARG(width), SLARG(height),
                                        SLARG(pad_rb_g), SLARG(d), SLARG(dir), SLARG(h), SLARG(sgreen),
                                        SLBUF(xtrans, 36));
+      if(check && ok)
+      {
+        dt_slang_gpu_buffer_read(trgb[0], c_rgb2, sizeof(float) * 4 * npix);
+        dt_slang_gpu_buffer_read(aux, c_aux2, sizeof(float) * 4 * npix);
+        _mk_check_solitary(c_rgb, c_aux, c_rgb2, c_aux2, xtrans, width, height, pad_rb_g, d, dir, h, sgreen);
+      }
+      dt_free_align(c_rgb);
+      dt_free_align(c_aux);
+      dt_free_align(c_rgb2);
+      dt_free_align(c_aux2);
       if((d < 2) || (d & 1)) trgb++;
     }
     for(int c = 0; c < 4; c++) _mk_stats("solitary_green", pass * 10 + c, rgb[c], 4, FALSE, width, height);
