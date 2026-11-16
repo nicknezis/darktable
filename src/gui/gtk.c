@@ -1254,7 +1254,10 @@ int dt_gui_gtk_load_config()
   else
     gtk_window_move(GTK_WINDOW(widget), 0, 0);
 
-  if(fullscreen)
+  const char *fst = g_getenv("DT_FS_TEST");
+  if(fullscreen && fst && fst[0] == 'c')
+    ; // variant c: fullscreen is applied from an idle callback in dt_gui_gtk_run()
+  else if(fullscreen)
     gtk_window_fullscreen(GTK_WINDOW(widget));
   else
   {
@@ -2378,6 +2381,26 @@ int dt_gui_gtk_init(dt_gui_gtk_t *gui)
   return 0;
 }
 
+static gboolean _fs_test_idle(gpointer data)
+{
+  fprintf(stderr, "[fs-test] fullscreen from idle\n");
+  gtk_window_fullscreen(GTK_WINDOW(dt_ui_main_window(darktable.gui->ui)));
+  return G_SOURCE_REMOVE;
+}
+
+void dt_gui_gtk_early_osx_ready(void)
+{
+  const char *fst = g_getenv("DT_FS_TEST");
+  if(!(fst && fst[0] == 'b')) return;
+  fprintf(stderr, "[fs-test] early ready + focus\n");
+#ifdef MAC_INTEGRATION
+  gtkosx_application_ready(g_object_new(GTKOSX_TYPE_APPLICATION, NULL));
+#endif
+#ifdef GDK_WINDOWING_QUARTZ
+  dt_osx_focus_window();
+#endif
+}
+
 void dt_gui_gtk_run(dt_gui_gtk_t *gui)
 {
   GtkWidget *widget = dt_ui_center(darktable.gui->ui);
@@ -2390,12 +2413,19 @@ void dt_gui_gtk_run(dt_gui_gtk_t *gui)
   const int tb = darktable.control->tabborder;
   dt_view_manager_configure(darktable.view_manager,
                             allocation.width - 2 * tb, allocation.height - 2 * tb);
+  const char *fst = g_getenv("DT_FS_TEST");
+  const gboolean fs = dt_conf_get_bool("ui_last/fullscreen");
+  fprintf(stderr, "[fs-test] variant=%s fullscreen=%d\n", fst ? fst : "none", fs);
 #ifdef MAC_INTEGRATION
-  gtkosx_application_ready(g_object_new(GTKOSX_TYPE_APPLICATION, NULL));
+  if(!(fst && fst[0] == 'b'))
+    gtkosx_application_ready(g_object_new(GTKOSX_TYPE_APPLICATION, NULL));
 #endif
 #ifdef GDK_WINDOWING_QUARTZ
-  dt_osx_focus_window();
+  if(!(fst && (fst[0] == 'b' || (fst[0] == 'a' && fs))))
+    dt_osx_focus_window();
 #endif
+  if(fst && fst[0] == 'c' && fs)
+    g_idle_add(_fs_test_idle, NULL);
   /* start the event loop */
   if(dt_control_running())
   {

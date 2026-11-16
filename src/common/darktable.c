@@ -2663,6 +2663,7 @@ int dt_init(int argc,
 
     // show the main window and restore its geometry to that saved in the config file
     gtk_widget_show_all(dt_ui_main_window(darktable.gui->ui));
+    { extern void dt_gui_gtk_early_osx_ready(void); dt_gui_gtk_early_osx_ready(); }
     dt_gui_gtk_load_config();
     dt_gui_process_events();
     dt_splash_screen_destroy();
