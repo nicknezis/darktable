@@ -16,16 +16,16 @@
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Slang port of ../contrastntexture.cl. The guided filter runs on the
-// kernels of toneequal.slang.
+// Slang port of ../contrastntexture.cl.
 
 import common;
+
+static const float INVERSE_SQRT_3 = 0.5773502691896258f;
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void contrastntexture_luminance(uint3 gid : SV_DispatchThreadID,
-                                uniform ImageIn in, uniform RWStructuredBuffer<float> luminance,
-                                uniform RWStructuredBuffer<float> highpass,
+                                uniform ImageIn in, uniform RWStructuredBuffer<float> log_luminance,
                                 uniform int width, uniform int height, uniform float noise_bias)
 {
   const int x = gid.x;
@@ -33,49 +33,63 @@ void contrastntexture_luminance(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float4 pixel = in.Areadpixel(x, y);
-  const float norm = max(dtcl_sqrt(pixel.x * pixel.x + pixel.y * pixel.y + pixel.z * pixel.z),
-                         NORM_MIN);
-  const int k = y * width + x;
-  const float lum = (1.0f / sqrt(3.0f)) * norm + noise_bias;
-  luminance[k] = lum;
-  highpass[k] = lum;
+  const float norm = INVERSE_SQRT_3 * dtcl_sqrt(pixel.x * pixel.x + pixel.y * pixel.y + pixel.z * pixel.z)
+                     + noise_bias;
+  log_luminance[y * width + x] = dtcl_log2(max(norm, NORM_MIN));
 }
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void contrastntexture_details(uint3 gid : SV_DispatchThreadID,
-                              uniform RWStructuredBuffer<float> highpass,
-                              uniform RWStructuredBuffer<float> lowpass,
-                              uniform RWStructuredBuffer<float> corrections,
-                              uniform int width, uniform int height, uniform float gain,
-                              uniform float noise_bias, uniform float next_bias_step,
-                              uniform int accumulate)
+void contrastntexture_guided_filter_pack(uint3 gid : SV_DispatchThreadID,
+                                         uniform StructuredBuffer<float> log_luminance,
+                                         uniform RWStructuredBuffer<float2> moments,
+                                         uniform int width, uniform int height, uniform float center)
 {
   const int x = gid.x;
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
   const int k = y * width + x;
-  const float pixel = highpass[k];
-  const float smoothed = lowpass[k];
-
-  const float log_pixel = dtcl_log2(max(pixel, NORM_MIN));
-  const float log_smoothed = dtcl_log2(max(smoothed, NORM_MIN));
-  const float noise_power = noise_bias * noise_bias;
-  const float combined_power = smoothed * smoothed;
-  const float weiner_gain = max(combined_power - noise_power, 0.0f) / max(combined_power, NORM_MIN);
-  const float detail = gain * (weiner_gain * clamp(log_pixel - log_smoothed, -5.0f, 5.0f));
-  corrections[k] = accumulate != 0 ? corrections[k] + detail : detail;
-
-  const float next = smoothed - next_bias_step;
-  lowpass[k] = next;
-  highpass[k] = next;
+  const float v = log_luminance[k] - center;
+  moments[k] = float2(v, v * v);
 }
 
-float _shadows_highlights(float luminance_lowpass, float slope_shadows, float slope_highlights,
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void contrastntexture_details(uint3 gid : SV_DispatchThreadID,
+                              uniform RWStructuredBuffer<float> log_luminance,
+                              uniform StructuredBuffer<float2> moments,
+                              uniform RWStructuredBuffer<float> corrections,
+                              uniform int width, uniform int height, uniform float feathering,
+                              uniform float gain, uniform float noise_bias, uniform float next_bias_step,
+                              uniform int accumulate, uniform int last_level, uniform float center)
+{
+  const int x = gid.x;
+  const int y = gid.y;
+  if(x >= width || y >= height) return;
+
+  const int k = y * width + x;
+  const float log_pixel = log_luminance[k];
+  const float2 m = moments[k];
+  const float variance = max(m.y - m.x * m.x, 0.0f);
+  const float a = fp32_div(variance, variance + feathering);
+  const float log_smoothed = a * log_pixel + (1.0f - a) * (m.x + center);
+  const float smoothed = dtcl_exp2(log_smoothed);
+
+  const float noise_power = noise_bias * noise_bias;
+  const float combined_power = smoothed * smoothed;
+  const float wiener_gain = fp32_div(max(combined_power - noise_power, 0.0f), max(combined_power, NORM_MIN));
+  const float detail = gain * (wiener_gain * clamp(log_pixel - log_smoothed, -5.0f, 5.0f));
+  corrections[k] = accumulate != 0 ? corrections[k] + detail : detail;
+
+  log_luminance[k] = last_level != 0 ? log_smoothed
+                                     : dtcl_log2(max(smoothed - next_bias_step, NORM_MIN));
+}
+
+float _shadows_highlights(float log_luminance_lowpass, float slope_shadows, float slope_highlights,
                           float midtones_width, float4 polynomial, float pivot_offset)
 {
-  const float normalized_ev = dtcl_log2(max(luminance_lowpass, NORM_MIN)) - pivot_offset;
+  const float normalized_ev = log_luminance_lowpass - pivot_offset;
   float correction_ev;
   if(normalized_ev <= -midtones_width)
     correction_ev = slope_shadows * normalized_ev;
@@ -142,7 +156,7 @@ void contrastntexture_display_lowpass(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
-  const float l = lowpass[y * width + x];
+  const float l = dtcl_exp2(lowpass[y * width + x]);
   const float intensity = l / (pivot_offset + l);
   float saturation = (intensity - 0.5f) * 2.0f;
   saturation *= saturation;
