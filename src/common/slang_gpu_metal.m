@@ -653,6 +653,15 @@ static gboolean _check(const gboolean wait)
 // commits cb without waiting for it
 static void _commit(id<MTLCommandBuffer> cb)
 {
+  // test only: GPU time of each command buffer
+  if(darktable.unmuted & DT_DEBUG_PERF)
+  {
+    NSString *label = cb.label ? cb.label : @"(blit)";
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      dt_print(DT_DEBUG_PERF, "[slang_gpu] GPU %s %.3f ms (start %.6f)", label.UTF8String,
+               1000.0 * (done.GPUEndTime - done.GPUStartTime), done.GPUStartTime);
+    }];
+  }
   [cb commit];
   if(!_mtl.inflight) _mtl.inflight = [NSMutableArray array];
   [_mtl.inflight addObject:cb];
@@ -869,6 +878,7 @@ static int _run(const char *program,
   if(host_out) _finish();
 
   cb = [_mtl.queue commandBuffer];
+  if(cb) cb.label = [NSString stringWithFormat:@"%s %dx%d", entry, width, height];
   enc = [cb computeCommandEncoder];
   if(!cb || !enc) goto failed;
   [enc setComputePipelineState:k->pipeline];
