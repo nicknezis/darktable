@@ -1389,7 +1389,7 @@ void process(dt_iop_module_t *self,
   float *restrict temp1 = _needs_temp1(data) ? dt_alloc_align_float(width * height * 4) : NULL;
   float *restrict temp2 = _needs_temp2(data) ? dt_alloc_align_float(width * height * 4) : NULL;
   // temp buffer for blurs. We will need to cycle between them for memory efficiency
-  float *restrict LF_odd, *restrict LF_even;
+  float *restrict LF_odd = NULL, *restrict LF_even = NULL;
 
   float *restrict temp_in = NULL;
   float *restrict temp_out = NULL;
