@@ -321,7 +321,7 @@ float sf_knee(float d, float threshold, float limit, float power)
 float3 sf_xyz_to_oklab(StructuredBuffer<float> mats, float3 xyz)
 {
   float3 lms = sf_mat3(mats, SF_M_OK1, xyz);
-  lms = float3(dt_cbrt(lms.x), dt_cbrt(lms.y), dt_cbrt(lms.z));
+  lms = float3(dt_cbrt_refined(lms.x), dt_cbrt_refined(lms.y), dt_cbrt_refined(lms.z));
   return sf_mat3(mats, SF_M_OK2, lms);
 }
 

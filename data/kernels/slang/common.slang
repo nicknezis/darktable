@@ -91,6 +91,19 @@ public vector<float, N> dt_cbrt<let N : int>(vector<float, N> x)
   return r;
 }
 
+// one more Newton step whose residual compensates the rounding of y * y,
+// see cbrt_refined() in ../common.h. Zero and infinity return early: the
+// step would divide by zero there
+public float dt_cbrt_refined(float x)
+{
+  const float y = dt_cbrt(x);
+  if(y == 0.0f || isinf(y)) return y;
+  const float y2 = y * y;
+  const float y2_err = fma(y, y, -y2);
+  const float residual = fma(-y, y2_err, fma(-y, y2, x));
+  return y + residual / (3.0f * y2);
+}
+
 public float dt_fast_hypot(float x, float y) { return dt_hypot(x, y); }
 
 // atan2() with C's results when y and x are both zero, which SPIR-V and Metal
