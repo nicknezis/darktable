@@ -884,7 +884,7 @@ float _calc_refavg(ImageIn in, StructuredBuffer<uint> xtrans, uint filters,
   }
 
   for(int c = 0; c < 3; c++)
-    mean[c] = (cnt[c] > 0.0f) ? dt_cbrt((correction[c] * mean[c]) / cnt[c]) : 0.0f;
+    mean[c] = (cnt[c] > 0.0f) ? dt_cbrt_refined(fp32_div(correction[c] * mean[c], cnt[c])) : 0.0f;
 
   const float croot_refavg[3] = { 0.5f * (mean[1] + mean[2]), 0.5f * (mean[0] + mean[2]), 0.5f * (mean[0] + mean[1]) };
   const int color = fcol(row, col, filters, xtrans);
@@ -925,7 +925,8 @@ void highlights_opposed(uint3 gid : SV_DispatchThreadID,
 // linear raws, as in ../basic.cl
 float _calc_linear_refavg(float4 pixel, int color)
 {
-  const float ins[3] = { dt_cbrt(max(0.0f, pixel.x)), dt_cbrt(max(0.0f, pixel.y)), dt_cbrt(max(0.0f, pixel.z)) };
+  const float ins[3] = { dt_cbrt_refined(max(0.0f, pixel.x)), dt_cbrt_refined(max(0.0f, pixel.y)),
+                         dt_cbrt_refined(max(0.0f, pixel.z)) };
   const float opp[3] = { 0.5f*(ins[1]+ins[2]), 0.5f*(ins[0]+ins[2]), 0.5f*(ins[0]+ins[1]) };
   return fcube(opp[color]);
 }
