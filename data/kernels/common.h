@@ -170,10 +170,13 @@ static inline float _radius_hypotf(const float x, const float y)
 }
 
 // a more precise cbrt() variant.
-// It uses OpenCL’s cbrt(x) as a seed and refines it with one FP32 Newton step.
+// It uses cbrt(x) as a seed and refines it with one FP32 Newton step.
+// Avoids the refinement for y==zero or infinite
 static inline float cbrt_refined(const float x)
 {
   const float y = cbrt(x);
+  if(y == 0.0f || isinf(y))
+    return y;
   const float y2 = y * y;
   const float y2_err = fma(y, y, -y2);
   // Compensate for rounding in y * y when computing x - y^3.
@@ -183,11 +186,7 @@ static inline float cbrt_refined(const float x)
 
 static inline float4 cbrt_refined_4(const float4 x)
 {
-  const float4 y = cbrt(x);
-  const float4 y2 = y * y;
-  const float4 y2_err = fma(y, y, -y2);
-  const float4 residual = fma(-y, y2_err, fma(-y, y2, x));
-  return y + residual / (3.0f * y2);
+  return (float4) { cbrt_refined(x.x), cbrt_refined(x.y), cbrt_refined(x.z), cbrt_refined(x.w) };
 }
 
 static inline int
