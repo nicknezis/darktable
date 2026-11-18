@@ -82,8 +82,9 @@ int guided_filter_cl(int devid, cl_mem guide, cl_mem in, cl_mem out, int width, 
 #include "common/slang_gpu.h"
 
 // like guided_filter_cl(), for a 4 channel guide and single channel images of
-// the Slang kernels. There is no tiling: it returns non-zero, and leaves out
-// undefined, if the device lacks the memory. Returns 0 on success.
+// the Slang kernels: it works in tiles of rows when the module memory is
+// short, and on the host when the tiles would be too thin. Returns 0 on
+// success, and non-zero, with out undefined, on failure.
 int guided_filter_slang(dt_slang_gpu_image_t *guide, dt_slang_gpu_image_t *in, dt_slang_gpu_image_t *out,
                         int width, int height, int w, float sqrt_eps, float guide_weight, float min,
                         float max);
