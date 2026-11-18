@@ -776,6 +776,18 @@ void init_presets(dt_iop_module_so_t *self)
                              DEVELOP_BLEND_CS_RGB_SCENE);
 }
 
+// the iterations write alternately to temp2 and temp1, and the last one to
+// the output. temp1 also holds the input with its highlights inpainted
+static inline gboolean _needs_temp1(const dt_iop_diffuse_data_t *const data)
+{
+  return data->iterations > 2 || data->threshold > 0.f;
+}
+
+static inline gboolean _needs_temp2(const dt_iop_diffuse_data_t *const data)
+{
+  return data->iterations > 1;
+}
+
 void tiling_callback(dt_iop_module_t *self,
                      dt_dev_pixelpipe_iop_t *piece,
                      const dt_iop_roi_t *roi_in,
@@ -791,9 +803,9 @@ void tiling_callback(dt_iop_module_t *self,
   const int scales = CLAMP(diffusion_scales, 1, MAX_NUM_SCALES);
   const int max_filter_radius = (1 << scales);
 
-  // in + out + 2 * tmp + 2 * LF + s details + grey mask
-  tiling->factor = 6.25f + scales;
-  tiling->factor_cl = 6.25f + scales;
+  // in + out + the tmp in use + 2 * LF + s details + grey mask
+  tiling->factor = 4.25f + _needs_temp1(data) + _needs_temp2(data) + scales;
+  tiling->factor_cl = tiling->factor;
 
   tiling->maxbuf = 1.0f;
   tiling->maxbuf_cl = 1.0f;
@@ -1374,7 +1386,8 @@ void process(dt_iop_module_t *self,
   float *restrict in = DT_IS_ALIGNED((float *const restrict)ivoid);
   float *const restrict out = DT_IS_ALIGNED((float *const restrict)ovoid);
 
-  float *restrict temp1, *restrict temp2;
+  float *restrict temp1 = _needs_temp1(data) ? dt_alloc_align_float(width * height * 4) : NULL;
+  float *restrict temp2 = _needs_temp2(data) ? dt_alloc_align_float(width * height * 4) : NULL;
   // temp buffer for blurs. We will need to cycle between them for memory efficiency
   float *restrict LF_odd, *restrict LF_even;
 
@@ -1382,9 +1395,9 @@ void process(dt_iop_module_t *self,
   float *restrict temp_out = NULL;
 
   gboolean out_of_memory = !mask
+    || (_needs_temp1(data) && !temp1)
+    || (_needs_temp2(data) && !temp2)
     || !dt_iop_alloc_image_buffers(self, roi_in, roi_out,
-                                 4 | DT_IMGSZ_OUTPUT, &temp1,
-                                 4 | DT_IMGSZ_OUTPUT, &temp2,
                                  4 | DT_IMGSZ_OUTPUT, &LF_odd,
                                  4 | DT_IMGSZ_OUTPUT, &LF_even,
                                  0, NULL); // if failing all pointers are NULL
@@ -1658,8 +1671,8 @@ int process_cl(dt_iop_module_t *self,
   cl_mem temp_in = NULL;
   cl_mem temp_out = NULL;
 
-  cl_mem temp1 = dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4);
-  cl_mem temp2 = dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4);
+  cl_mem temp1 = _needs_temp1(data) ? dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4) : NULL;
+  cl_mem temp2 = _needs_temp2(data) ? dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4) : NULL;
   cl_mem mask = dt_opencl_alloc_device(devid, width, height, sizeof(uint8_t));
   // temp buffer for blurs. We will need to cycle between them for memory efficiency
   cl_mem LF_even = dt_opencl_alloc_device(devid, width, height, sizeof(float) * 4);
@@ -1682,7 +1695,8 @@ int process_cl(dt_iop_module_t *self,
 
   // check that all buffers exist before processing,
   // because we use a lot of memory here.
-  if(!temp1 || !temp2 || !LF_odd || !LF_even || !mask || out_of_memory)
+  if((_needs_temp1(data) && !temp1) || (_needs_temp2(data) && !temp2)
+     || !LF_odd || !LF_even || !mask || out_of_memory)
   {
     dt_opencl_enqueue_copy_image(devid, dev_in, dev_out, CLIMG_ORIGIN, CLIMG_ORIGIN, region);
     err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
@@ -1898,15 +1912,15 @@ gboolean process_slang(dt_iop_module_t *self,
   const int diffusion_scales = num_steps_to_reach_equivalent_sigma(B_SPLINE_SIGMA, final_radius);
   const int scales = CLAMP(diffusion_scales, 1, MAX_NUM_SCALES);
 
-  // the device holds 4 + scales images of the full size besides the input
-  // and output; without the memory for them the module runs on the CPU
-  dt_slang_gpu_image_t *temp1 = dt_slang_gpu_image_new(width, height, 4, NULL);
-  dt_slang_gpu_image_t *temp2 = dt_slang_gpu_image_new(width, height, 4, NULL);
+  // the device holds up to 4 + scales images of the full size besides the
+  // input and output; without the memory for them the module runs on the CPU
+  dt_slang_gpu_image_t *temp1 = _needs_temp1(data) ? dt_slang_gpu_image_new(width, height, 4, NULL) : NULL;
+  dt_slang_gpu_image_t *temp2 = _needs_temp2(data) ? dt_slang_gpu_image_new(width, height, 4, NULL) : NULL;
   dt_slang_gpu_image_t *mask = dt_slang_gpu_image_new(width, height, 1, NULL);
   dt_slang_gpu_image_t *LF_even = dt_slang_gpu_image_new(width, height, 4, NULL);
   dt_slang_gpu_image_t *LF_odd = dt_slang_gpu_image_new(width, height, 4, NULL);
   dt_slang_gpu_image_t *HF[MAX_NUM_SCALES] = { NULL };
-  int err = !temp1 || !temp2 || !mask || !LF_even || !LF_odd;
+  int err = (_needs_temp1(data) && !temp1) || (_needs_temp2(data) && !temp2) || !mask || !LF_even || !LF_odd;
   for(int s = 0; s < scales && !err; s++)
   {
     HF[s] = dt_slang_gpu_image_new(width, height, 4, NULL);
