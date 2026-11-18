@@ -757,38 +757,29 @@ static int _slang_update_covariance(const int width,
                                   SLIMG_DEV(a), SLIMG_DEV(b), SLARG(eps));
 }
 
-int guided_filter_slang(dt_slang_gpu_image_t *guide,
-                        dt_slang_gpu_image_t *in,
-                        dt_slang_gpu_image_t *out,
-                        const int width,
-                        const int height,
-                        const int w,              // window size
-                        const float sqrt_eps,     // regularization parameter
-                        const float guide_weight, // to balance the amplitudes in the guiding and input image
-                        const float min,
-                        const float max)
+// one pass over the height rows of in and out, guided by the rows from first
+// on of guide, in the 19 temporaries img
+static int _slang_guided_filter_rows(dt_slang_gpu_image_t *guide,
+                                     dt_slang_gpu_image_t *in,
+                                     dt_slang_gpu_image_t *out,
+                                     dt_slang_gpu_image_t **img,
+                                     const int width,
+                                     const int height,
+                                     const int first,
+                                     const int w,
+                                     const float eps,
+                                     const float guide_weight,
+                                     const float min,
+                                     const float max)
 {
-  const float eps = sqrt_eps * sqrt_eps; // this is the regularization parameter of the original papers
-  const int first = 0;
-
-  // temp1, temp2, img_mean, imgg_mean_r/g/b, cov_imgg_img_r/g/b,
-  // var_imgg_rr/rg/rb/gg/gb/bb, a_r, a_g, a_b and b, as in _guided_filter_cl_impl()
   enum { SL_TEMP1, SL_TEMP2, SL_IMG_MEAN, SL_MEAN_R, SL_MEAN_G, SL_MEAN_B, SL_COV_R, SL_COV_G, SL_COV_B,
          SL_VAR_RR, SL_VAR_RG, SL_VAR_RB, SL_VAR_GG, SL_VAR_GB, SL_VAR_BB,
-         SL_A_R, SL_A_G, SL_A_B, SL_B, SL_N_IMAGES };
-  dt_slang_gpu_image_t *img[SL_N_IMAGES] = { NULL };
-  int err = 0;
-  for(int k = 0; k < SL_N_IMAGES && !err; k++)
-  {
-    img[k] = dt_slang_gpu_image_new(width, height, 1, NULL);
-    err = !img[k];
-  }
+         SL_A_R, SL_A_G, SL_A_B, SL_B };
 
-  if(!err)
-    err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_split_rgb_image", width, height,
-                                   SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide),
-                                   SLIMG_DEV(img[SL_MEAN_R]), SLIMG_DEV(img[SL_MEAN_G]), SLIMG_DEV(img[SL_MEAN_B]),
-                                   SLARG(guide_weight));
+  int err = dt_slang_gpu_run_2d_args("guided_filter", "guided_filter_split_rgb_image", width, height,
+                                     SLARG(width), SLARG(height), SLARG(first), SLIMG_DEV(guide),
+                                     SLIMG_DEV(img[SL_MEAN_R]), SLIMG_DEV(img[SL_MEAN_G]), SLIMG_DEV(img[SL_MEAN_B]),
+                                     SLARG(guide_weight));
 
   if(!err) err = _slang_box_mean(width, height, w, in, img[SL_IMG_MEAN], img[SL_TEMP1]);
   if(!err) err = _slang_box_mean(width, height, w, img[SL_MEAN_R], img[SL_MEAN_R], img[SL_TEMP1]);
@@ -840,9 +831,117 @@ int guided_filter_slang(dt_slang_gpu_image_t *guide,
                                    SLIMG_DEV(img[SL_A_R]), SLIMG_DEV(img[SL_A_G]), SLIMG_DEV(img[SL_A_B]),
                                    SLIMG_DEV(img[SL_B]), SLIMG_DEV(out),
                                    SLARG(guide_weight), SLARG(min), SLARG(max));
+  return err;
+}
+
+// the guided filter on the host, as _guided_filter_cl_fallback() does
+static int _slang_guided_filter_host(dt_slang_gpu_image_t *guide,
+                                     dt_slang_gpu_image_t *in,
+                                     dt_slang_gpu_image_t *out,
+                                     const int width,
+                                     const int height,
+                                     const int w,
+                                     const float sqrt_eps,
+                                     const float guide_weight,
+                                     const float min,
+                                     const float max)
+{
+  float *guide_host = dt_alloc_align_float((size_t)width * height * 4);
+  float *in_host = dt_alloc_align_float((size_t)width * height);
+  float *out_host = dt_alloc_align_float((size_t)width * height);
+  int err = !guide_host || !in_host || !out_host;
+  if(!err) err = dt_slang_gpu_image_read(guide, guide_host);
+  if(!err) err = dt_slang_gpu_image_read(in, in_host);
+  if(!err)
+  {
+    guided_filter(guide_host, in_host, out_host, width, height, 4, w, sqrt_eps, guide_weight, min, max);
+    err = dt_slang_gpu_image_write(out, out_host);
+  }
+  dt_free_align(guide_host);
+  dt_free_align(in_host);
+  dt_free_align(out_host);
+  return err;
+}
+
+int guided_filter_slang(dt_slang_gpu_image_t *guide,
+                        dt_slang_gpu_image_t *in,
+                        dt_slang_gpu_image_t *out,
+                        const int width,
+                        const int height,
+                        const int w,              // window size
+                        const float sqrt_eps,     // regularization parameter
+                        const float guide_weight, // to balance the amplitudes in the guiding and input image
+                        const float min,
+                        const float max)
+{
+  const float eps = sqrt_eps * sqrt_eps; // this is the regularization parameter of the original papers
+
+  // tiles of rows, as in _guided_filter_cl_impl(), but sized from all the
+  // memory a module may use now. OpenCL first sets two 4 channel images
+  // aside, which leaves a 61 MP image with 2 GB about 100 MB: 121 tiles of
+  // 53 rows on the M4 for colorequal's feathering, 6 times slower than in
+  // one pass. Here the guide and the input are already allocated, and
+  // dt_slang_gpu_memory_info() counts them once the device runs short. A
+  // tile as high as the image runs untiled
+  size_t allmem = 0;
+  int max_dim = 0;
+  dt_slang_gpu_memory_info(&allmem, &max_dim);
+  const int64_t available = (int64_t)allmem;
+  const int64_t per_line = (int64_t)width * 21 * sizeof(float);
+  const int overlap = dt_round_size(2 * w + 16, 16);
+  const int tile_height = available > 0 ? (int)MIN(available / per_line, (int64_t)INT_MAX) : 0;
+  const gboolean tiling = tile_height < height;
+  const int valid_rows = tiling ? tile_height - 2 * overlap : height;
+  const int num_tiles = valid_rows > 0 ? (height + valid_rows - 1) / valid_rows : 0;
+  // as on OpenCL, a tile mostly spent on its overlap is slower than the host
+  const gboolean possible = !tiling || (tile_height > 0 && (float)valid_rows / (float)tile_height > 0.1f);
+
+  if(tiling)
+    dt_print(DT_DEBUG_PIPE | DT_DEBUG_TILING | DT_DEBUG_SLANG,
+             "[guided slang filter] %s tile_height=%d tiles=%d valid=%d overlap=%d",
+             possible ? "tiling" : "on the host", tile_height, num_tiles, valid_rows, overlap);
+
+  if(!possible)
+    return _slang_guided_filter_host(guide, in, out, width, height, w, sqrt_eps, guide_weight, min, max);
+
+  const int g_height = tiling ? tile_height : height;
+  enum { SL_N_IMAGES = 19 };
+  dt_slang_gpu_image_t *img[SL_N_IMAGES] = { NULL };
+  dt_slang_gpu_image_t *tile_in = tiling ? dt_slang_gpu_image_new(width, g_height, 1, NULL) : in;
+  dt_slang_gpu_image_t *tile_out = tiling ? dt_slang_gpu_image_new(width, g_height, 1, NULL) : out;
+  int err = !tile_in || !tile_out;
+  for(int k = 0; k < SL_N_IMAGES && !err; k++)
+  {
+    img[k] = dt_slang_gpu_image_new(width, g_height, 1, NULL);
+    err = !img[k];
+  }
+
+  for(int tile_nr = 0; tile_nr < num_tiles && !err; tile_nr++)
+  {
+    const int group = tile_nr * valid_rows;
+    const int topline = group - overlap;
+    const int first_in = tiling ? MAX(0, topline) : 0;
+    const int last_in = tiling ? MIN(height, group + valid_rows + overlap) : height;
+    const int t_height = last_in - first_in;
+    const int first_out = tiling ? group - first_in : 0;
+    const int out_height = MIN(valid_rows, height - group);
+
+    if(tiling)
+      err = dt_slang_gpu_image_copy(in, 0, first_in, tile_in, 0, 0, width, t_height);
+    if(!err)
+      err = _slang_guided_filter_rows(guide, tile_in, tile_out, img, width, t_height, first_in, w, eps,
+                                      guide_weight, min, max);
+    if(!err && tiling)
+      err = dt_slang_gpu_image_copy(tile_out, 0, first_out, out, 0, group, width, out_height);
+  }
 
   if(err) dt_slang_gpu_wait();
   for(int k = 0; k < SL_N_IMAGES; k++) dt_slang_gpu_image_free(img[k]);
+  if(tiling)
+  {
+    dt_slang_gpu_image_free(tile_in);
+    dt_slang_gpu_image_free(tile_out);
+  }
   return err;
 }
 #endif
