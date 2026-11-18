@@ -145,6 +145,16 @@ void rcd_step_2(uint3 gid : SV_DispatchThreadID,
     + 0.25f * (cfa[idx - w - 1] + cfa[idx - w + 1] + cfa[idx + w - 1] + cfa[idx + w + 1]);
 }
 
+// see _cardinal_eps() in src/iop/demosaicing/rcd.c
+float _cardinal_eps(const float grad)
+{
+  const float flat_end = eps + 1e-4f;
+  const float edge_start = eps + 1e-3f;
+  const float t = fp32_div(grad - flat_end, edge_start - flat_end);
+  const float u = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+  return eps * (1.0f - u * u * (3.0f - 2.0f * u));
+}
+
 // Step 3: Populate the green channel at blue and red CFA positions
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -177,10 +187,11 @@ void rcd_step_3(uint3 gid : SV_DispatchThreadID,
 
   const float lfpi = lpf[lidx];
   // Cardinal pixel estimations
-  const float N_Est = fp32_div(cfa[idx - w] * (lfpi + lfpi), eps + lfpi + lpf[lidx - hw2]);
-  const float S_Est = fp32_div(cfa[idx + w] * (lfpi + lfpi), eps + lfpi + lpf[lidx + hw2]);
-  const float W_Est = fp32_div(cfa[idx - 1] * (lfpi + lfpi), eps + lfpi + lpf[lidx - 1]);
-  const float E_Est = fp32_div(cfa[idx + 1] * (lfpi + lfpi), eps + lfpi + lpf[lidx + 1]);
+  const float cardinal_eps = _cardinal_eps(max(max(max(N_Grad, S_Grad), W_Grad), E_Grad));
+  const float N_Est = fp32_div(cfa[idx - w] * (lfpi + lfpi + cardinal_eps), eps + lfpi + lpf[lidx - hw2]);
+  const float S_Est = fp32_div(cfa[idx + w] * (lfpi + lfpi + cardinal_eps), eps + lfpi + lpf[lidx + hw2]);
+  const float W_Est = fp32_div(cfa[idx - 1] * (lfpi + lfpi + cardinal_eps), eps + lfpi + lpf[lidx - 1]);
+  const float E_Est = fp32_div(cfa[idx + 1] * (lfpi + lfpi + cardinal_eps), eps + lfpi + lpf[lidx + 1]);
 
   // Vertical and horizontal estimations
   const float V_Est = fp32_div(S_Grad * N_Est + N_Grad * S_Est, N_Grad + S_Grad);
