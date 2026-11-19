@@ -23,6 +23,7 @@
 #include "common/darktable.h"
 #include "common/opencl.h"
 #include "control/conf.h"
+#include "develop/pixelpipe.h"
 #include "control/control.h"
 #include "common/utility.h"
 
@@ -96,6 +97,79 @@ gboolean dt_slang_gpu_avoid_module(const char *op)
 {
   const char *avoid = dt_conf_get_string_const("slang_gpu_avoid");
   return avoid && *avoid && dt_str_commasubstring(avoid, op);
+}
+
+// whether one pipe's part of opencl_device_priority, such as "!0,*", gives
+// device 0 to the pipe, as _opencl_priority_parse() reads it. A leading '+'
+// makes OpenCL wait for a busy device; the Slang device has no lock, so a
+// pipe never waits for it and the flag changes nothing here
+static gboolean _priority_has_device0(const char *prio)
+{
+  if(!prio || !*prio) return FALSE;
+  if(*prio == '+') prio++;
+
+  gboolean found = FALSE;
+  gboolean decided = FALSE;
+  gchar **tokens = g_strsplit(prio, ",", 0);
+  for(gchar **t = tokens; *t && !decided; t++)
+  {
+    const char *str = *t;
+    if(*str == '*')
+    {
+      found = decided = TRUE;
+      continue;
+    }
+    const gboolean not = *str == '!';
+    while(*str == '!') str++;
+    char *end = NULL;
+    const long number = strtol(str, &end, 10);
+    // device names never match: they name OpenCL devices
+    if(end != str && number == 0)
+    {
+      found = !not;
+      decided = TRUE;
+    }
+  }
+  g_strfreev(tokens);
+  return found;
+}
+
+gboolean dt_slang_gpu_pipe_allowed(const int pipetype)
+{
+  int index;
+  switch(pipetype & DT_DEV_PIXELPIPE_ANY)
+  {
+    case DT_DEV_PIXELPIPE_FULL:      index = 0; break;
+    case DT_DEV_PIXELPIPE_PREVIEW:   index = 1; break;
+    case DT_DEV_PIXELPIPE_EXPORT:    index = 2; break;
+    case DT_DEV_PIXELPIPE_THUMBNAIL: index = 3; break;
+    case DT_DEV_PIXELPIPE_PREVIEW2:  index = 4; break;
+    default: return TRUE;
+  }
+
+  // both other profiles give every pipe every device, see
+  // _opencl_apply_scheduling_profile()
+  const char *profile = dt_conf_get_string_const("opencl_scheduling_profile");
+  if(!g_strcmp0(profile, "multiple GPUs") || !g_strcmp0(profile, "very fast GPU"))
+    return TRUE;
+
+  // drop what _opencl_priorities_parse() drops, such as spaces
+  const char *conf = dt_conf_get_string_const("opencl_device_priority");
+  GString *clean = g_string_new(NULL);
+  for(const char *c = conf; c && *c; c++)
+    if(g_ascii_isalnum(*c) || strchr("/!,*+", *c)) g_string_append_c(clean, *c);
+
+  gchar **pipes = g_strsplit(clean->str, "/", 0);
+  gboolean allowed = FALSE;
+  for(int i = 0; pipes[i]; i++)
+    if(i == index)
+    {
+      allowed = _priority_has_device0(pipes[i]);
+      break;
+    }
+  g_strfreev(pipes);
+  g_string_free(clean, TRUE);
+  return allowed;
 }
 
 static void _device_free(gpointer data)
