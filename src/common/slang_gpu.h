@@ -118,6 +118,11 @@ void dt_slang_gpu_devices_free(GList *devices);
 // OpenCL code, like a module in an OpenCL device's _nocl list
 gboolean dt_slang_gpu_avoid_module(const char *op);
 
+// TRUE if a pipe of this type may run the Slang kernels. The device follows
+// opencl_scheduling_profile and opencl_device_priority as OpenCL device 0
+// would, so in the default profile the preview pipes stay on the CPU
+gboolean dt_slang_gpu_pipe_allowed(const int pipetype);
+
 // the share of system memory slang_gpu_unified_fraction gives a device
 // without memory of its own, or automatic if it is not set
 float dt_slang_gpu_unified_fraction(const float automatic);
