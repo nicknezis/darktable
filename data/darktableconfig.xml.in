@@ -570,6 +570,25 @@
     <shortdescription>activate Slang support</shortdescription>
     <longdescription>experimental: run the modules ported to Slang on your graphics card through Vulkan or Metal.\nwith OpenCL also active, OpenCL runs the other modules.\ncan be switched on and off at any time.</longdescription>
   </dtconfig>
+  <dtconfig prefs="processing" section="slang" capability="slang">
+    <name>slang_scheduling_profile</name>
+    <type>
+      <enum>
+        <option>default</option>
+        <option>very fast GPU</option>
+      </enum>
+    </type>
+    <default>default</default>
+    <shortdescription>Slang scheduling profile</shortdescription>
+    <longdescription>experimental: which pixelpipes run on the Slang GPU:\n - 'default': the GPU processes the full pipe and the CPU the preview pipe (adaptable by slang_device_priority),\n - 'very fast GPU': every pipe runs on the GPU, one after the other.</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>slang_device_priority</name>
+    <type>string</type>
+    <default>*/!0,*/*/*/!0,*</default>
+    <shortdescription>Slang GPU use for each pixelpipe type</shortdescription>
+    <longdescription>experimental: for the 'default' Slang scheduling profile, which pixelpipe types (full, preview, export, thumbnail, preview2) run on the Slang GPU, written like opencl_device_priority with the Slang GPU as device 0</longdescription>
+  </dtconfig>
   <dtconfig>
     <name>slang_gpu_device</name>
     <type>string</type>
