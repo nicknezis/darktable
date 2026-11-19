@@ -1636,8 +1636,9 @@ float _lens_grid_value(StructuredBuffer<float> grid, const int x, const int y,
 {
   const int i = x / step;
   const int j = y / step;
-  const float tx = float(x - i * step) / float(step);
-  const float ty = float(y - j * step) / float(step);
+  // for some steps like 3 we need a precise division
+  const float tx = fp32_div(float(x - i * step), float(step));
+  const float ty = fp32_div(float(y - j * step), float(step));
   const int p00 = (j * gwidth + i) * stride + n;
   const int p01 = p00 + gwidth * stride;
   const float left = _lens_grid_lerp(grid[p00], grid[p01], ty);
@@ -1667,7 +1668,9 @@ float4 _lens_bilinear(ImageIn in, const float rx, const float ry, const int iwid
 }
 
 // the weighted sum of the kwidth wide filter around (rx, ry), in all channels.
-// lanczos is 0 for bicubic.
+// lanczos is 0 for bicubic. As in the CPU interpolators of
+// src/common/interpolation.c, the bicubic weights are not normalized, their
+// norm being 1 by construction, and the lanczos sum is multiplied by 1/norm.
 float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth, const int lanczos,
                     const int iwidth, const int iheight)
 {
@@ -1691,7 +1694,7 @@ float4 _lens_filter(ImageIn in, const float rx, const float ry, const int kwidth
       sum += in.Areadpixel(clip_mirror(i, iwidth - 1), clip_mirror(j, iheight - 1)) * w;
       weight += w;
     }
-  return sum / weight;
+  return lanczos != 0 ? sum * fp32_div(1.0f, weight) : sum;
 }
 
 // clip_rotate_bilinear, _bicubic, _lanczos2 and _lanczos3 in ../basic.cl in
@@ -1818,8 +1821,7 @@ void _lens_distort(const uint3 gid, ImageIn in, ImageOut out, const int width, c
   for(int c = 0; c < 3; c++)
   {
     // held inside the input as in the CPU path of src/iop/lens.cc, so that
-    // coordinates past the edge sample the edge pixel. fmin() and fmax()
-    // also map NaN to an edge there.
+    // coordinates past the edge sample the edge pixel
     const float rx = fmax(fmin(ppi[2 * c] - float(roi_in_x), float(iwidth) - 1.0f), 0.0f);
     const float ry = fmax(fmin(ppi[2 * c + 1] - float(roi_in_y), float(iheight) - 1.0f), 0.0f);
     const float4 px = bilinear != 0 ? _lens_bilinear(in, rx, ry, iwidth, iheight)
@@ -2393,7 +2395,7 @@ void _ashift(const uint3 gid, ImageIn in, ImageOut out, const int width, const i
       }
 
     // as ashift_bicubic in ../basic.cl, only the lanczos weights are normalized
-    if(lanczos != 0) pixel /= weight;
+    if(lanczos != 0) pixel *= fp32_div(1.0f, weight);
     pixel = (tx >= -1 && ty >= -1 && tx < iwidth && ty < iheight) ? pixel : float4(0.0f);
   }
   out.write(int2(x, y), pixel);
