@@ -99,10 +99,10 @@ gboolean dt_slang_gpu_avoid_module(const char *op)
   return avoid && *avoid && dt_str_commasubstring(avoid, op);
 }
 
-// whether one pipe's part of opencl_device_priority, such as "!0,*", gives
-// device 0 to the pipe, as _opencl_priority_parse() reads it. A leading '+'
-// makes OpenCL wait for a busy device; the Slang device has no lock, so a
-// pipe never waits for it and the flag changes nothing here
+// whether one pipe's part of slang_device_priority, such as "!0,*", gives
+// device 0 to the pipe, as _opencl_priority_parse() reads the same syntax.
+// A leading '+' makes OpenCL wait for a busy device; the Slang device has no
+// lock, so a pipe never waits for it and the flag changes nothing here
 static gboolean _priority_has_device0(const char *prio)
 {
   if(!prio || !*prio) return FALSE;
@@ -123,7 +123,7 @@ static gboolean _priority_has_device0(const char *prio)
     while(*str == '!') str++;
     char *end = NULL;
     const long number = strtol(str, &end, 10);
-    // device names never match: they name OpenCL devices
+    // the Slang GPU has no name in this list, only the number 0
     if(end != str && number == 0)
     {
       found = !not;
@@ -147,14 +147,11 @@ gboolean dt_slang_gpu_pipe_allowed(const int pipetype)
     default: return TRUE;
   }
 
-  // both other profiles give every pipe every device, see
-  // _opencl_apply_scheduling_profile()
-  const char *profile = dt_conf_get_string_const("opencl_scheduling_profile");
-  if(!g_strcmp0(profile, "multiple GPUs") || !g_strcmp0(profile, "very fast GPU"))
+  if(!g_strcmp0(dt_conf_get_string_const("slang_scheduling_profile"), "very fast GPU"))
     return TRUE;
 
   // drop what _opencl_priorities_parse() drops, such as spaces
-  const char *conf = dt_conf_get_string_const("opencl_device_priority");
+  const char *conf = dt_conf_get_string_const("slang_device_priority");
   GString *clean = g_string_new(NULL);
   for(const char *c = conf; c && *c; c++)
     if(g_ascii_isalnum(*c) || strchr("/!,*+", *c)) g_string_append_c(clean, *c);
