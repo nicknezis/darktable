@@ -4669,7 +4669,7 @@ gboolean dt_dev_pixelpipe_process(dt_dev_pixelpipe_t *pipe,
   if(!pipe->slang_enabled && dt_slang_gpu_enabled())
     dt_print_pipe(DT_DEBUG_PIPE | DT_DEBUG_SLANG, "pipe without Slang",
                   pipe, NULL, DT_DEVICE_NONE, NULL, NULL,
-                  "opencl_device_priority gives this pipe no GPU");
+                  "slang_device_priority gives this pipe no GPU");
 #endif
 
   // if devid is a valid CL device we don't lock it as the caller has done so already
