@@ -198,12 +198,28 @@ jobs:
         run: |
           slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
           dirname "${slangc}" >> "$GITHUB_PATH"
+      - name: Fetch ONNX Runtime
+        run: |
+          # FindONNXRuntime.cmake gets the archive checksum from the GitHub
+          # releases API, and that call fails on the runners (with or without
+          # a token), so configure stops at "ONNX Runtime not found". Fetch
+          # the archive here against a pinned checksum instead; the module
+          # finds it in src/external/onnxruntime before trying to download
+          ver=1.24.4
+          case "${{ runner.arch }}" in
+            X64)   pkg=onnxruntime-linux-x64-${ver}.tgz
+                   sha=3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747 ;;
+            ARM64) pkg=onnxruntime-linux-aarch64-${ver}.tgz
+                   sha=866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e ;;
+          esac
+          grep -q "ONNXRUNTIME_VERSION \"${ver}\"" src/cmake/modules/FindONNXRuntime.cmake || {
+            echo "FindONNXRuntime.cmake no longer pins ${ver}: update this step"; exit 1; }
+          curl -fsSL --retry 3 -o "${pkg}" "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/${pkg}"
+          echo "${sha}  ${pkg}" | sha256sum -c -
+          mkdir -p src/src/external/onnxruntime
+          tar -xzf "${pkg}" --strip-components=1 -C src/src/external/onnxruntime
+          rm "${pkg}"
       - name: Build AppImage
-        env:
-          # FindONNXRuntime.cmake reads the ORT checksum from the GitHub
-          # releases API; unauthenticated calls from shared runners hit the
-          # rate limit and the configure step then fails
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd src
           bash tools/appimage-build-script.sh --enable-slang
