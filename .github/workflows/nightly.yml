@@ -199,6 +199,11 @@ jobs:
           slangc=$(./src/.ci/install-slangc.sh "${{ github.workspace }}/slang")
           dirname "${slangc}" >> "$GITHUB_PATH"
       - name: Build AppImage
+        env:
+          # FindONNXRuntime.cmake reads the ORT checksum from the GitHub
+          # releases API; unauthenticated calls from shared runners hit the
+          # rate limit and the configure step then fails
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd src
           bash tools/appimage-build-script.sh --enable-slang
