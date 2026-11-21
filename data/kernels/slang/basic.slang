@@ -114,7 +114,7 @@ float4 _colorin(ImageIn in, int x, int y, StructuredBuffer<float> cmat, Structur
                 StructuredBuffer<float> dev_hsm, int encoding, int use_hsm, int hdr_transfer, bool clipping)
 {
   const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
-  float4 pixel = corval * in.readpixel(x, y);
+  float4 pixel = corval * in.Areadpixel(x, y);
   const float alpha = pixel.w;
 
   float3 cam;
@@ -280,7 +280,7 @@ void colorin_rgb(uint3 gid : SV_DispatchThreadID,
 
   const ProfileInfo wp = work[0];
   const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
-  const float4 input = in.readpixel(x, y);
+  const float4 input = in.Areadpixel(x, y);
   float4 pixel = corval * input;
   const float alpha = input.w;
 
@@ -477,7 +477,7 @@ void colorin_clut(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float4 corval = float4(corr[0], corr[1], corr[2], corr[3]);
-  const float4 raw = in.readpixel(x, y);
+  const float4 raw = in.Areadpixel(x, y);
   float4 pixel = dt_lut3d_tetrahedral(clip4(corval * raw), clut, level);
   pixel.w = raw.w;
   out.write(int2(x, y), pixel);
@@ -2239,8 +2239,8 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
 
   if(x >= width || y >= height) return;
 
-  float4 pixel = in.read(int2(x, y));
-  const float L_in = pixel.x / 100.0f;
+  float4 pixel = in.Areadpixel(x, y);
+  const float L_in = fp32_div(pixel.x, 100.0f);
   // use lut or extrapolation:
   const float L = _tonecurve_lookup_L(table_L, L_in, coeffs_L);
 
@@ -2266,8 +2266,8 @@ void tonecurve(uint3 gid : SV_DispatchThreadID,
   {
     if(L_in > 0.01f)
     {
-      pixel.y *= L / pixel.x;
-      pixel.z *= L / pixel.x;
+      pixel.y *= fp32_div(L, pixel.x);
+      pixel.z *= fp32_div(L, pixel.x);
     }
     else
     {
@@ -2484,7 +2484,7 @@ void colorcorrection(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
-  float4 pixel = in.readpixel(x, y);
+  float4 pixel = in.Areadpixel(x, y);
   pixel.y = saturation * (pixel.y + pixel.x * a_scale + a_base);
   pixel.z = saturation * (pixel.z + pixel.x * b_scale + b_base);
   out.write(int2(x, y), pixel);

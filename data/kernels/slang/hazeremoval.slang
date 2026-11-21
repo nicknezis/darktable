@@ -94,9 +94,9 @@ void hazeremoval_transision_map(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float4 pixel = in.read(int2(x, y));
-  float m = pixel.x / A0_r;
-  m = min(pixel.y / A0_g, m);
-  m = min(pixel.z / A0_b, m);
+  float m = fp32_div(pixel.x, A0_r);
+  m = min(fp32_div(pixel.y, A0_g), m);
+  m = min(fp32_div(pixel.z, A0_b), m);
   out.write(int2(x, y), float4(1.f - m * strength));
 }
 
@@ -110,11 +110,11 @@ void hazeremoval_dehaze(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= width || y >= height) return;
 
-  const float4 pixel = in.read(int2(x, y));
+  const float4 pixel = in.Areadpixel(x, y);
   const float t = max(trans_map.readsingle(x, y), t_min);
 
-  out.write(int2(x, y), float4((pixel.x - A0.x) / t + A0.x, (pixel.y - A0.y) / t + A0.y,
-                               (pixel.z - A0.z) / t + A0.z, pixel.w));
+  out.write(int2(x, y), float4(fp32_div(pixel.x - A0.x, t) + A0.x, fp32_div(pixel.y - A0.y, t) + A0.y,
+                               fp32_div(pixel.z - A0.z, t) + A0.z, pixel.w));
 }
 
 // hazeremoval_dark_channel, _histogram and _ambient_sums in ../hazeremoval.cl:

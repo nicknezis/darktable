@@ -140,7 +140,7 @@ void contrastntexture_display_details(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float local_ev = corrections[y * width + x];
-  const float intensity = local_ev / dtcl_sqrt(local_ev * local_ev + 1.0f) * 0.5f + 0.5f;
+  const float intensity = fp32_div(local_ev, dtcl_sqrt(local_ev * local_ev + 1.0f)) * 0.5f + 0.5f;
   out.write(int2(x, y), float4(intensity, intensity, intensity, 1.0f));
 }
 
@@ -157,7 +157,7 @@ void contrastntexture_display_lowpass(uint3 gid : SV_DispatchThreadID,
   if(x >= width || y >= height) return;
 
   const float l = dtcl_exp2(lowpass[y * width + x]);
-  const float intensity = l / (pivot_offset + l);
+  const float intensity = fp32_div(l, pivot_offset + l);
   float saturation = (intensity - 0.5f) * 2.0f;
   saturation *= saturation;
   const float4 tint = intensity < 0.5f ? float4(0.0f, 0.0f, 1.0f, 0.0f)

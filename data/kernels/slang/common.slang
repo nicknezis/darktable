@@ -169,6 +169,13 @@ public float scharr_gradient(StructuredBuffer<float> in, int k, int w)
   return dt_fast_hypot(gx, gy);
 }
 
+// vector variant of fp32_div() below, component by component like
+// fp32_div_4() in ../common.h, so each lane keeps the range guards
+public float4 fp32_div_4(float4 a, float4 b)
+{
+  return float4(fp32_div(a.x, b.x), fp32_div(a.y, b.y), fp32_div(a.z, b.z), fp32_div(a.w, b.w));
+}
+
 // Newton-Raphson refined division, see fp32_div() in ../common.h. Operands,
 // seed and quotient outside the ranges below take the plain division, so
 // zero, infinity, NaN and subnormals keep IEEE results (x / 0 is inf, not NaN)
