@@ -38,7 +38,7 @@
 
 static inline float _ca_interpolatef(const float a, const float b, const float c)
 {
-  return a * (b - c) + c;
+  return dt_mix(c, b, a);
 }
 
 kernel void
