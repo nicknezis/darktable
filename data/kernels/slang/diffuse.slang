@@ -140,7 +140,7 @@ void diffuse_pde(uint3 gid : SV_DispatchThreadID,
 
   const bool opacity = has_mask != 0 ? mask.Areadsingle(x, y) != 0.0f : true;
 
-  const float4 regularization_factor = float4(regularization * current_radius_square / 9.f);
+  const float4 regularization_factor = float4(fp32_div(regularization * current_radius_square, 9.f));
 
   float4 result;
 
@@ -173,12 +173,12 @@ void diffuse_pde(uint3 gid : SV_DispatchThreadID,
     // cos and sin of arg(grad) and arg(lapl), with arg forced to 0 where the
     // magnitude is 0
     const float4 magnitude_grad = dtcl_sqrt(sqf(gradient[0]) + sqf(gradient[1]));
-    gradient[0] = select(magnitude_grad != 0.f, gradient[0] / magnitude_grad, float4(1.f));
-    gradient[1] = select(magnitude_grad != 0.f, gradient[1] / magnitude_grad, float4(0.f));
+    gradient[0] = select(magnitude_grad != 0.f, fp32_div_4(gradient[0], magnitude_grad), float4(1.f));
+    gradient[1] = select(magnitude_grad != 0.f, fp32_div_4(gradient[1], magnitude_grad), float4(0.f));
 
     const float4 magnitude_lapl = dtcl_sqrt(sqf(laplacian[0]) + sqf(laplacian[1]));
-    laplacian[0] = select(magnitude_lapl != 0.f, laplacian[0] / magnitude_lapl, float4(1.f));
-    laplacian[1] = select(magnitude_lapl != 0.f, laplacian[1] / magnitude_lapl, float4(0.f));
+    laplacian[0] = select(magnitude_lapl != 0.f, fp32_div_4(laplacian[0], magnitude_lapl), float4(1.f));
+    laplacian[1] = select(magnitude_lapl != 0.f, fp32_div_4(laplacian[1], magnitude_lapl), float4(0.f));
 
     const float4 cos_theta_grad_sq = sqf(gradient[0]);
     const float4 sin_theta_grad_sq = sqf(gradient[1]);
@@ -223,7 +223,7 @@ void diffuse_pde(uint3 gid : SV_DispatchThreadID,
     float4 acc = float4(0.f);
     for(int k = 0; k < 4; k++) acc += derivatives[k] * ABCD[k];
     const float4 hf = HF.Areadpixel(x, y);
-    acc = (hf * strength + acc / variance);
+    acc = (hf * strength + fp32_div_4(acc, variance));
 
     // update the solution
     const float4 lf = LF.Areadpixel(x, y);
