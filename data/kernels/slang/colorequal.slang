@@ -161,7 +161,7 @@ void apply_prefilter(uint3 gid : SV_DispatchThreadID,
                            ak.z * UV.x + ak.w * UV.y + bk.y);
 
   const float satweight = _get_satweight(saturation[k] - sat_shift, weights);
-  uv[k] = float2(lerp(UV.x, cv.x, satweight), lerp(UV.y, cv.y, satweight));
+  uv[k] = float2(dt_mix(UV.x, cv.x, satweight), dt_mix(UV.y, cv.y, satweight));
 }
 
 [shader("compute")]

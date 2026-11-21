@@ -2779,7 +2779,7 @@ void monochrome(uint3 gid : SV_DispatchThreadID,
   const float4 basep = base.Areadpixel(x, y);
   const float tt = _monochrome_envelope(pixel.x);
   const float t = tt + (1.0f - tt) * (1.0f - highlights);
-  pixel.x = lerp(pixel.x, pixel.x * basep.x / 100.0f, t);
+  pixel.x = dt_mix(pixel.x, pixel.x * basep.x / 100.0f, t);
   pixel.y = pixel.z = 0.0f;
   out.write(int2(x, y), pixel);
 }

@@ -348,5 +348,5 @@ void hl_remosaic_and_replace(uint3 gid : SV_DispatchThreadID,
   const float opacity = clipf(clipping_mask.Areadpixel(j, i).w);
   const float pix_in = input.Areadsingle(j, i);
   const float correction = max(interpolated.Areadpixel(j, i)[c] * wb[c], 0.f);
-  output.write(int2(j, i), float4(opacity * correction + (1.f - opacity) * pix_in, 0.f, 0.f, 0.f));
+  output.write(int2(j, i), float4(dt_mix(pix_in, correction, opacity), 0.f, 0.f, 0.f));
 }
