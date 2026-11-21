@@ -151,8 +151,10 @@ void bilinear_image(uint3 gid : SV_DispatchThreadID,
   const int y = int(gid.y);
   if(x >= width_out || y >= height_out) return;
 
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  // the refined division keeps the sample position, and so the weights of
+  // the four neighbours, as precise as on the CPU
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   const int x_prev = clamp(int(floor(x_in)), 0, width_in - 1);
   const int x_next = clamp(x_prev + 1, 0, width_in - 1);

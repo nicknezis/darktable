@@ -143,8 +143,9 @@ void hl_bilinear(uint3 gid : SV_DispatchThreadID,
   const int y = gid.y;
   if(x >= width_out || y >= height_out) return;
 
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  // the refined division of bilinear_image in bilinear.slang
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   int x_prev = int(floor(x_in));
   int x_next = x_prev + 1;
