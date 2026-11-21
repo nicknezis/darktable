@@ -223,7 +223,7 @@ void capture_result(uint3 gid : SV_DispatchThreadID,
   if(blendmask[k] > 0.0f)
   {
     const float mixer = clipf(blendmask[k]);
-    const float luminance_new = lerp(luminance[k], tmp[k], mixer);
+    const float luminance_new = dt_mix(luminance[k], tmp[k], mixer);
     pix *= float4(fp32_div(luminance_new, max(luminance[k], CAPTURE_YMIN)));
   }
   out.write(int2(col, row), pix);

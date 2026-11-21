@@ -193,6 +193,23 @@ public float fp32_div(float a, float b)
   return fma(r, y, q);
 }
 
+// linear blend matching dt_mix() in ../common.h. lerp() maps to the backend
+// mix(), whose precision is implementation-defined; a = 0 and a = 1 return
+// x and y exactly
+public float dt_mix(float x, float y, float a)
+{
+  if(a == 0.0f) return x;
+  if(a == 1.0f) return y;
+  return fma(y - x, a, x);
+}
+
+public float4 dt_mix4(float4 x, float4 y, float a)
+{
+  if(a == 0.0f) return x;
+  if(a == 1.0f) return y;
+  return fma(y - x, float4(a), x);
+}
+
 // compensated radius for the lens kernels, see _radius_hypotf() in
 // ../common.h: dt_hypot() can be an ulp off, which moves where the lens
 // correction samples
