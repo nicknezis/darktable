@@ -36,7 +36,7 @@ import common;
 static const float eps = 1e-5f;
 static const int TILE = 112; // ts - 2 * border in cacorrect.c
 
-float _interpolatef(float a, float b, float c) { return a * (b - c) + c; }
+float _interpolatef(float a, float b, float c) { return dt_mix(c, b, a); }
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
