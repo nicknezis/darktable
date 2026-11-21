@@ -2076,7 +2076,10 @@ static int make_tests(test_t *t)
               IMG_IN("in", image_in), INT("width_in", W), INT("height_in", H),
               { .kind = ARG_IMAGE_OUT, .name = "out", .w = CW, .h = CH, .channels = 4 },
               INT("width_out", CW), INT("height_out", CH));
-    TEST_GRID("bilinear_image up", "bilinear", "bilinear_image", 1e-6, W, H,
+    // the refined division needs a fused fma(), which Vulkan does not promise
+    // (Fma in SPIR-V may be a separate mul and add): on lavapipe a few
+    // columns land 1.7e-5 away
+    TEST_GRID("bilinear_image up", "bilinear", "bilinear_image", 5e-5, W, H,
               { .kind = ARG_IMAGE_IN, .name = "in", .w = CW, .h = CH, .channels = 4, .pixels = image_in },
               INT("width_in", CW), INT("height_in", CH), IMG_OUT("out"), INT("width_out", W),
               INT("height_out", H));
