@@ -169,7 +169,17 @@ public float scharr_gradient(StructuredBuffer<float> in, int k, int w)
   return dt_fast_hypot(gx, gy);
 }
 
-// Newton-Raphson refined division, see fp32_div() in ../common.h
+// Newton-Raphson refined division, see fp32_div() and fp32_div_4() in ../common.h
+public float4 fp32_div_4(float4 a, float4 b)
+{
+  float4 y = rcp(b);
+  const float4 e = fma(-b, y, float4(1.0f));
+  y = fma(y, e, y);
+  const float4 q = a * y;
+  const float4 r = fma(-b, q, a);
+  return fma(r, y, q);
+}
+
 public float fp32_div(float a, float b)
 {
   float y = rcp(b);

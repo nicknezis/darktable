@@ -128,7 +128,7 @@ void toneequal_luminance_mask(uint3 gid : SV_DispatchThreadID,
       const float4 RGB_cubic = RGB_square * value;
       const float numerator = RGB_cubic.x + RGB_cubic.y + RGB_cubic.z;
       const float denominator = RGB_square.x + RGB_square.y + RGB_square.z;
-      lum = exposure_boost * numerator / denominator;
+      lum = fp32_div(exposure_boost * numerator, denominator);
       break;
     }
 
@@ -143,7 +143,7 @@ void toneequal_luminance_mask(uint3 gid : SV_DispatchThreadID,
     case TONEEQ_MEAN:
     default:
       // mean(RGB) is the intensity
-      lum = exposure_boost * (pixel.x + pixel.y + pixel.z) / 3.0f;
+      lum = fp32_div(exposure_boost * (pixel.x + pixel.y + pixel.z), 3.0f);
       break;
   }
 
@@ -161,8 +161,8 @@ float _pixel_correction(float exposure, float4 factors_low, float4 factors_high,
   const float4 radius_low = exposure - centers_low;
   const float4 radius_high = exposure - centers_high;
 
-  const float4 gauss_low = dtcl_exp(-radius_low * radius_low / gauss_denom) * factors_low;
-  const float4 gauss_high = dtcl_exp(-radius_high * radius_high / gauss_denom) * factors_high;
+  const float4 gauss_low = dtcl_exp(fp32_div_4(-radius_low * radius_low, float4(gauss_denom))) * factors_low;
+  const float4 gauss_high = dtcl_exp(fp32_div_4(-radius_high * radius_high, float4(gauss_denom))) * factors_high;
 
   const float4 result = gauss_low + gauss_high;
 
@@ -373,7 +373,7 @@ void toneequal_gf_ab(uint3 gid : SV_DispatchThreadID,
 
   // avoid division by 0
   const float d = max((avg.z - avg.x * avg.x) + feathering, 1e-15f);
-  const float a = (avg.w - avg.x * avg.y) / d;
+  const float a = fp32_div(avg.w - avg.x * avg.y, d);
   const float b = avg.y - a * avg.x;
   ab[k] = float2(a, b);
 }
@@ -501,9 +501,9 @@ float _eigf_blend(float pixel, float mask, float4 avg, int filter, float feather
 
   const float norm_g = max(avg_g * pixel, 1E-6f);
   const float norm_m = max(avg_m * mask, 1E-6f);
-  const float normalized_var_guide = var_g / norm_g;
-  const float normalized_covar = covar_mg / dtcl_sqrt(norm_g * norm_m);
-  const float a = normalized_covar / (normalized_var_guide + feathering);
+  const float normalized_var_guide = fp32_div(var_g, norm_g);
+  const float normalized_covar = fp32_div(covar_mg, dtcl_sqrt(norm_g * norm_m));
+  const float a = fp32_div(normalized_covar, normalized_var_guide + feathering);
   const float b = avg_m - a * avg_g;
 
   const float blended = max(pixel * a + b, TONEEQ_MIN_FLOAT);
@@ -535,8 +535,8 @@ float _eigf_blend_no_mask(float pixel, float2 avg, int filter, float feathering)
   const float var_g = avg.y;
 
   const float norm_g = max(avg_g * pixel, 1E-6f);
-  const float normalized_var_guide = var_g / norm_g;
-  const float a = normalized_var_guide / (normalized_var_guide + feathering);
+  const float normalized_var_guide = fp32_div(var_g, norm_g);
+  const float a = fp32_div(normalized_var_guide, normalized_var_guide + feathering);
   const float b = avg_g - a * avg_g;
 
   const float blended = max(pixel * a + b, TONEEQ_MIN_FLOAT);

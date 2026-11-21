@@ -162,7 +162,7 @@ float filmic_spline(float x, Spline sp)
     {
       const float xi = sp.latitude_min - x;
       const float rat = xi * (xi * sp.M2.x + 1.f);
-      result = sp.M4.x - sp.M1.x * rat / (rat + sp.M3.x);
+      result = sp.M4.x - fp32_div(sp.M1.x * rat, rat + sp.M3.x);
     }
   }
   else if(x > sp.latitude_max)
@@ -843,7 +843,7 @@ void wavelets_reconstruct(uint3 gid : SV_DispatchThreadID,
   const float4 TT_c = texture.readpixel(x, y);
 
   const float grey_texture = fmaxabsf(fmaxabsf(TT_c.x, TT_c.y), TT_c.z);
-  const float grey_details = (HF_c.x + HF_c.y + HF_c.z) / 3.f;
+  const float grey_details = fp32_div(HF_c.x + HF_c.y + HF_c.z, 3.f);
 
   float4 details;
   float4 residual;
@@ -851,7 +851,7 @@ void wavelets_reconstruct(uint3 gid : SV_DispatchThreadID,
   if(variant == DT_FILMIC_RECONSTRUCT_RGB)
   {
     const float grey_HF = beta_comp * (gamma_comp * grey_details + gamma * grey_texture);
-    const float grey_residual = beta_comp * (LF_c.x + LF_c.y + LF_c.z) / 3.f;
+    const float grey_residual = fp32_div(beta_comp * (LF_c.x + LF_c.y + LF_c.z), 3.f);
 
     details = (gamma_comp * HF_c + gamma * TT_c) * beta + grey_HF;
     residual = (s == scales - 1) ? grey_residual + LF_c * beta : float4(0.f);
@@ -884,7 +884,7 @@ void compute_ratios(uint3 gid : SV_DispatchThreadID,
 
   const float4 i = in.readpixel(x, y);
   const float norm = max(pixel_rgb_norm_euclidean(i), NORM_MIN);
-  const float4 ratio = i / norm;
+  const float4 ratio = fp32_div_4(i, float4(norm));
   norms.write(int2(x, y), float4(norm));
   ratios.write(int2(x, y), ratio);
 }
