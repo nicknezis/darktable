@@ -2020,15 +2020,17 @@ static int make_tests(test_t *t)
     static const int bl_ch[3] = { 1, 2, 4 };
     static const char *bl_kernels[3] = { "bilinear1", "bilinear2", "bilinear4" };
     static char bl_labels[3][2][32];
+    // 5e-5 for the refined division, as for bilinear_image below: lavapipe
+    // does not fuse Fma, so a few columns land up to 4e-5 away
     for(int c = 0; c < 3; c++)
     {
       const size_t px = bl_ch[c] * sizeof(float);
       snprintf(bl_labels[c][0], sizeof(bl_labels[c][0]), "%s down", bl_kernels[c]);
-      TEST_GRID(bl_labels[c][0], "bilinear", bl_kernels[c], 1e-6, BW, BH,
+      TEST_GRID(bl_labels[c][0], "bilinear", bl_kernels[c], 5e-5, BW, BH,
                 BUFFER("in", image_in, px * W * H), INT("width_in", W), INT("height_in", H),
                 BUFFER_OUT("out", NULL, px * BW * BH), INT("width_out", BW), INT("height_out", BH));
       snprintf(bl_labels[c][1], sizeof(bl_labels[c][1]), "%s up", bl_kernels[c]);
-      TEST_GRID(bl_labels[c][1], "bilinear", bl_kernels[c], 1e-6, W, H,
+      TEST_GRID(bl_labels[c][1], "bilinear", bl_kernels[c], 5e-5, W, H,
                 BUFFER("in", image_in, px * BW * BH), INT("width_in", BW), INT("height_in", BH),
                 BUFFER_OUT("out", NULL, px * W * H), INT("width_out", W), INT("height_out", H));
     }

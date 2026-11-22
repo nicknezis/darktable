@@ -34,8 +34,8 @@ void bilinear1(uint3 gid : SV_DispatchThreadID,
   if(x >= width_out || y >= height_out) return;
 
   // relative coordinates of the pixel in output space, then absolute ones in input space
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   // nearest neighbours in input space
   int x_prev = int(floor(x_in));
@@ -73,8 +73,8 @@ void bilinear2(uint3 gid : SV_DispatchThreadID,
   if(x >= width_out || y >= height_out) return;
 
   // relative coordinates of the pixel in output space, then absolute ones in input space
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   // nearest neighbours in input space
   int x_prev = int(floor(x_in));
@@ -112,8 +112,8 @@ void bilinear4(uint3 gid : SV_DispatchThreadID,
   if(x >= width_out || y >= height_out) return;
 
   // relative coordinates of the pixel in output space, then absolute ones in input space
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   // nearest neighbours in input space
   int x_prev = int(floor(x_in));

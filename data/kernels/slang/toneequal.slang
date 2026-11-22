@@ -44,8 +44,8 @@ vector<float, N> _bilinear_sample<let N : int>(StructuredBuffer<vector<float, N>
                                                int width_in, int height_in, int x, int y,
                                                int width_out, int height_out)
 {
-  const float x_in = (float(x) / float(width_out)) * float(width_in);
-  const float y_in = (float(y) / float(height_out)) * float(height_in);
+  const float x_in = fp32_div(float(x), float(width_out)) * float(width_in);
+  const float y_in = fp32_div(float(y), float(height_out)) * float(height_in);
 
   int x_prev = int(floor(x_in));
   int x_next = x_prev + 1;
