@@ -169,13 +169,26 @@ public float scharr_gradient(StructuredBuffer<float> in, int k, int w)
   return dt_fast_hypot(gx, gy);
 }
 
-// Newton-Raphson refined division, see fp32_div() in ../common.h
+// Newton-Raphson refined division, see fp32_div() in ../common.h. Operands,
+// seed and quotient outside the ranges below take the plain division, so
+// zero, infinity, NaN and subnormals keep IEEE results (x / 0 is inf, not NaN)
 public float fp32_div(float a, float b)
 {
+  const float lo = 0x1p-64f;
+  const float hi = 0x1p64f;
+  if(!(abs(a) >= lo && abs(a) <= hi && abs(b) >= lo && abs(b) <= hi))
+    return a / b;
+
   float y = rcp(b);
   const float e = fma(-b, y, 1.0f);
+  if(!(abs(e) <= 0x1p-10f))
+    return a / b;
+
   y = fma(y, e, y);
   const float q = a * y;
+  if(!(abs(q) >= lo && abs(q) <= hi))
+    return a / b;
+
   const float r = fma(-b, q, a);
   return fma(r, y, q);
 }
@@ -185,9 +198,13 @@ public float fp32_div(float a, float b)
 // correction samples
 public float dt_radius_hypot(float x, float y)
 {
+  // non-finite and extreme inputs take the plain hypot, as the CPU code does
+  if(!isfinite(x) || !isfinite(y)) return dt_hypot(x, y);
+
   const float ax = abs(x), ay = abs(y);
   const float a = max(ax, ay), b = min(ax, ay);
   if(a == 0.0f) return 0.0f;
+  if(a < 0x1p-60f || a > 0x1p60f) return dt_hypot(x, y);
 
   const float aa = a * a;
   const float bb = b * b;
