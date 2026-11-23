@@ -30,6 +30,11 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 
 # DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
+# kernels whose OpenCL twin sets FP_CONTRACT OFF. Metal fuses a*b+c into an
+# fma by default, even without fast math, and in cacorrect those 1-ulp
+# changes flip the overshoot decisions that the CPU and OpenCL now agree on
+set(DT_SLANG_NO_FP_CONTRACT cacorrect)
+
 set(DT_SLANG_OUTPUTS "")
 if(APPLE)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/entries")
@@ -68,6 +73,13 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES})
     foreach(ENTRY IN ITEMS ${ENTRIES})
       string(REGEX REPLACE "^\\[\\[kernel\\]\\] void ([A-Za-z0-9_]+)\\(.*" "\\1" ENTRY "${ENTRY}")
+      set(DT_SLANG_METAL_CONTRACT "")
+      set(DT_SLANG_METAL_PRAGMA "")
+      if(KERNAME IN_LIST DT_SLANG_NO_FP_CONTRACT)
+        set(DT_SLANG_METAL_CONTRACT -Xmetal -ffp-contract=off)
+        set(DT_SLANG_METAL_PRAGMA COMMAND ${CMAKE_COMMAND} -DFILE=${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metal
+                                  -P ${CMAKE_CURRENT_SOURCE_DIR}/metal_no_fp_contract.cmake)
+      endif()
       if(DT_SLANG_METALLIB)
         set(METALLIB "${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metallib")
         # Metal compiles with fast math unless told otherwise, which lets it
@@ -75,7 +87,7 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
         # loosens results that the OpenCL kernels compute without it
         add_custom_command(
           OUTPUT  ${METALLIB}
-          COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -Xmetal -fno-fast-math -o ${METALLIB}
+          COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metallib ${DT_SLANG_FLAGS} -Xmetal -fno-fast-math ${DT_SLANG_METAL_CONTRACT} -o ${METALLIB}
           DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
           COMMENT "Compiling Slang kernel ${KERNAME}:${ENTRY} to a Metal library"
         )
@@ -88,6 +100,7 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
         add_custom_command(
           OUTPUT  ${METAL}
           COMMAND ${SLANGC_EXECUTABLE} ${KERNEL} -entry ${ENTRY} -stage compute -target metal ${DT_SLANG_FLAGS} -o ${METAL}
+          ${DT_SLANG_METAL_PRAGMA}
           DEPENDS ${KERNEL} ${DT_SLANG_MODULE_FILES}
           COMMENT "Translating Slang kernel ${KERNAME}:${ENTRY} to Metal source"
         )
