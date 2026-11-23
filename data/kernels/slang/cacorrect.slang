@@ -36,7 +36,6 @@ import common;
 static const float eps = 1e-5f;
 static const int TILE = 112; // ts - 2 * border in cacorrect.c
 
-float _interpolatef(float a, float b, float c) { return a * (b - c) + c; }
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -179,77 +178,75 @@ void cacorrect_filters(uint3 gid : SV_DispatchThreadID,
   filt[5 * plane + h] = glpfh + rblh;
 }
 
-groupshared float coeff_sums[12][256];
-
-// the colour variance coefficients of one tile per 16x16 work group, into
-// sums[tile * 12 + dir * 6 + k * 2 + color], as coeff[dir][k][color] in
-// cacorrect.c
+// per tile and direction, the color variance coefficients in exactly the
+// order of the CPU loop in process(), so the float sums are bit-identical:
+// sums[tile * 12 + dir * 6 + k * 2 + color] as coeff[dir][k][color].
+// global size: (2 * htiles, vtiles)
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void cacorrect_tile_sums(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID,
+void cacorrect_tile_sums(uint3 gid : SV_DispatchThreadID,
                          uniform StructuredBuffer<float> raw, uniform StructuredBuffer<float> green,
                          uniform StructuredBuffer<float> filt, uniform RWStructuredBuffer<float> sums,
                          uniform int width, uniform int height, uniform int hwidth, uniform int htiles,
-                         uniform uint filters)
+                         uniform int vtiles, uniform uint filters)
 {
-  const int l = int(lid.y * 16 + lid.x);
+  const int gx = int(gid.x);
+  const int kv = int(gid.y);
+  const int kh = gx >> 1;
+  const int dir = gx & 1;
+  if(kh >= htiles || kv >= vtiles) return;
+
   const int ewidth = width + 16;
   const int plane = (height + 16) * hwidth;
-  const int row0 = int(grp.y) * TILE;
-  const int col0 = int(grp.x) * TILE;
+  const int hv = 2 * hwidth;
+  const int row0 = kv * TILE;
+  const int col0 = kh * TILE;
   const int row1 = min(row0 + TILE, height);
   const int col1 = min(col0 + TILE, width);
 
-  float s[12];
-  for(int k = 0; k < 12; k++) s[k] = 0.0f;
+  // planes and neighbor offsets for this direction
+  const int hp = dir == 0 ? 0 : plane;             // rbhpfv / rbhpfh
+  const int lp = dir == 0 ? 2 * plane : 3 * plane; // rblpfv / rblpfh
+  const int gp = dir == 0 ? 4 * plane : 5 * plane; // grblpfv / grblpfh
+  const int hn = dir == 0 ? 1 : hv;                // neighbors in the hpf average
+  const int ln = dir == 0 ? hv : 1;                // neighbors in the lpf terms
+  const int gn = dir == 0 ? ewidth : 1;            // gradient direction in green
+  const int gt = dir == 0 ? 1 : ewidth;            // transverse offset in green
 
-  for(int row = row0 + int(lid.y); row < row1; row += 16)
+  float s0[2] = { 0.0f, 0.0f };
+  float s1[2] = { 0.0f, 0.0f };
+  float s2[2] = { 0.0f, 0.0f };
+
+  for(int row = row0; row < row1; row++)
   {
     const int y = row + 8;
-    for(int col = col0 + (FC(row, 0, filters) & 1) + 2 * int(lid.x); col < col1; col += 32)
+    for(int col = col0 + (FC(row, 0, filters) & 1); col < col1; col += 2)
     {
       const int x = col + 8;
       const int i = y * ewidth + x;
       const int h = y * hwidth + (x >> 1);
-      const int hv = 2 * hwidth; // two rows up or down in the filter planes
       const int ci = FC(row, col, filters) >> 1;
 
-      // vertical
-      float gdiff = 0.3125f * (green[i + ewidth] - green[i - ewidth])
-                    + 0.09375f * (green[i + ewidth + 1] - green[i - ewidth + 1]
-                                  + green[i + ewidth - 1] - green[i - ewidth - 1]);
+      const float gdiff = 0.3125f * (green[i + gn] - green[i - gn])
+                          + 0.09375f * (green[i + gn + gt] - green[i - gn + gt]
+                                        + green[i + gn - gt] - green[i - gn - gt]);
       const float deltgrb = raw[i] - green[i];
-      float gradwt = fp32_div(abs(0.25f * filt[h] + 0.125f * (filt[h + 1] + filt[h - 1]))
-                              * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv]),
-                              eps + 0.1f * (filt[4 * plane + h - hv] + filt[4 * plane + h + hv])
-                              + filt[2 * plane + h - hv] + filt[2 * plane + h + hv]);
-      s[ci] += gradwt * deltgrb * deltgrb;
-      s[2 + ci] += gradwt * gdiff * deltgrb;
-      s[4 + ci] += gradwt * gdiff * gdiff;
+      const float num = abs(0.25f * filt[hp + h] + 0.125f * (filt[hp + h + hn] + filt[hp + h - hn]))
+                        * (filt[gp + h - ln] + filt[gp + h + ln]);
+      const float den = eps + 0.1f * (filt[gp + h - ln] + filt[gp + h + ln])
+                        + filt[lp + h - ln] + filt[lp + h + ln];
+      const float gradwt = fp32_div(num, den);
 
-      // horizontal
-      gdiff = 0.3125f * (green[i + 1] - green[i - 1])
-              + 0.09375f * (green[i + 1 + ewidth] - green[i - 1 + ewidth]
-                            + green[i + 1 - ewidth] - green[i - 1 - ewidth]);
-      gradwt = fp32_div(abs(0.25f * filt[plane + h] + 0.125f * (filt[plane + h + hv] + filt[plane + h - hv]))
-                        * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1]),
-                        eps + 0.1f * (filt[5 * plane + h - 1] + filt[5 * plane + h + 1])
-                        + filt[3 * plane + h - 1] + filt[3 * plane + h + 1]);
-      s[6 + ci] += gradwt * deltgrb * deltgrb;
-      s[8 + ci] += gradwt * gdiff * deltgrb;
-      s[10 + ci] += gradwt * gdiff * gdiff;
+      s0[ci] += gradwt * deltgrb * deltgrb;
+      s1[ci] += gradwt * gdiff * deltgrb;
+      s2[ci] += gradwt * gdiff * gdiff;
     }
   }
 
-  for(int k = 0; k < 12; k++) coeff_sums[k][l] = s[k];
-  GroupMemoryBarrierWithGroupSync();
-  for(int offset = 128; offset > 0; offset >>= 1)
-  {
-    if(l < offset)
-      for(int k = 0; k < 12; k++) coeff_sums[k][l] += coeff_sums[k][l + offset];
-    GroupMemoryBarrierWithGroupSync();
-  }
-  if(l < 12) sums[(int(grp.y) * htiles + int(grp.x)) * 12 + l] = coeff_sums[l][0];
+  const int o = (kv * htiles + kh) * 12 + dir * 6;
+  sums[o + 0] = s0[0]; sums[o + 1] = s0[1];
+  sums[o + 2] = s1[0]; sums[o + 3] = s1[1];
+  sums[o + 4] = s2[0]; sums[o + 5] = s2[1];
 }
 
 struct Shift
@@ -261,11 +258,9 @@ struct Shift
 // green at the CA shift point of extended sensel i
 float _gint(StructuredBuffer<float> green, int i, int ewidth, Shift s)
 {
-  const float gfloor = _interpolatef(s.hfrac, green[i + s.vfloor * ewidth + s.hceil],
-                                     green[i + s.vfloor * ewidth + s.hfloor]);
-  const float gceil = _interpolatef(s.hfrac, green[i + s.vceil * ewidth + s.hceil],
-                                    green[i + s.vceil * ewidth + s.hfloor]);
-  return _interpolatef(s.vfrac, gceil, gfloor);
+  const float gfloor = dt_mix(green[i + s.vfloor * ewidth + s.hfloor], green[i + s.vfloor * ewidth + s.hceil], s.hfrac);
+  const float gceil = dt_mix(green[i + s.vceil * ewidth + s.hfloor], green[i + s.vceil * ewidth + s.hceil], s.hfrac);
+  return dt_mix(gfloor, gceil, s.vfrac);
 }
 
 // the correction pass: red and blue from the colour differences at their
@@ -332,9 +327,9 @@ void cacorrect_correct(uint3 gid : SV_DispatchThreadID,
   const float g = green[i];
   float o = raw[i];
   const float grbdiffold = g - o;
-  const float grbdiffinthfloor = _interpolatef(hfrac, grbdiff[1], grbdiff[0]);
-  const float grbdiffinthceil = _interpolatef(hfrac, grbdiff[3], grbdiff[2]);
-  float grbdiffint = _interpolatef(vfrac, grbdiffinthceil, grbdiffinthfloor);
+  const float grbdiffinthfloor = dt_mix(grbdiff[0], grbdiff[1], hfrac);
+  const float grbdiffinthceil = dt_mix(grbdiff[2], grbdiff[3], hfrac);
+  float grbdiffint = dt_mix(grbdiffinthfloor, grbdiffinthceil, vfrac);
 
   const float RBint = g - grbdiffint;
   if(abs(RBint - o) < 0.25f * (RBint + o))
