@@ -753,7 +753,8 @@ void process(dt_iop_module_t *self,
     dt_aligned_pixel_t scaled_RGB;
     for_each_channel(c)
       scaled_RGB[c] = abs_RGB[c] /d->white_fulcrum;
-    dt_vector_powf(scaled_RGB, midtones, RGB);
+    for_each_channel(c)
+      RGB[c] = powf(scaled_RGB[c], midtones[c]);
     for_each_channel(c)
       RGB[c] = RGB[c] * sign[c] * d->white_fulcrum;
 
@@ -778,7 +779,7 @@ void process(dt_iop_module_t *self,
       dt_XYZ_2_JzAzBz(XYZ_D65, Jab);
 
       // Convert to JCh
-      float JC[2] = { Jab[0], dt_fast_hypotf(Jab[1], Jab[2]) };   // brightness/chroma vector
+      float JC[2] = { Jab[0], hypotf(Jab[1], Jab[2]) };   // brightness/chroma vector
       const float h = atan2f(Jab[2], Jab[1]);  // hue : (a, b) angle
 
       // Project JC onto S, the saturation eigenvector, with orthogonal vector O.
@@ -862,7 +863,7 @@ void process(dt_iop_module_t *self,
       xyY_to_dt_UCS_JCH(xyY, L_white, JCH);
       dt_UCS_JCH_to_HCB(JCH, HCB);
 
-      const float radius = dt_fast_hypotf(HCB[1], HCB[2]);
+      const float radius = hypotf(HCB[1], HCB[2]);
       const float sin_T = (radius > 0.f) ? HCB[1] / radius : 0.f;
       const float cos_T = (radius > 0.f) ? HCB[2] / radius : 0.f;
       const float DT_ALIGNED_PIXEL M_rot_inv[2][2] = { { cos_T,  sin_T }, { -sin_T, cos_T } };
@@ -875,7 +876,7 @@ void process(dt_iop_module_t *self,
       float a = MAX(1.f + d->saturation_global + scalar_product(opacities, saturation), 0.f);
       const float b = MAX(1.f + d->brilliance_global + scalar_product(opacities, brilliance), 0.f);
 
-      const float max_a = dt_fast_hypotf(P, W) / P;
+      const float max_a = hypotf(P, W) / P;
       a = soft_clip(a, 0.5f * max_a, max_a);
 
       const float P_prime = (a - 1.f) * P;
@@ -1283,7 +1284,7 @@ void commit_params(dt_iop_module_t *self, dt_iop_params_t *p1, dt_dev_pixelpipe_
             dt_XYZ_2_JzAzBz(XYZ, Jab);           // this one expects D65 XYZ
 
             Jch[0] = Jab[0];
-            Jch[1] = dt_fast_hypotf(Jab[2], Jab[1]);
+            Jch[1] = hypotf(Jab[2], Jab[1]);
             Jch[2] = atan2f(Jab[2], Jab[1]);
 
             saturation = (Jch[0] > 0.f) ? Jch[1] / Jch[0] : 0.f;
