@@ -44,25 +44,9 @@
 *    x86/64 machines, tested on Xeon E-2288G, i5-8250U.
 */
 
-/* We don't want to use the -Ofast option in dt as it effects are not well specified and there have been issues
-   leading to crashes.
-   But we can use the 'fast-math' option in code sections if input data and algorithms are well defined.
-
-   We have defined input data and make sure there are no divide-by-zero or overflows by chosen eps
-   Reordering of instructions might lead to a slight loss of presision whigh is not significant here.
-   Not necessary in this code section
-     threadsafe handling of errno
-     signed zero handling
-     handling of math interrupts
-     handling of rounding
-     handling of overflows
-
-   The 'fp-contract=fast' option enables fused multiply&add if available
-*/
-
-#ifdef __GNUC__
+#if defined(__GNUC__) && !defined(__clang__)
   #pragma GCC push_options
-  #pragma GCC optimize ("fp-contract=fast", "finite-math-only", "no-math-errno")
+  #pragma GCC optimize ("fp-contract=fast")
 #endif
 
 #define RCD_BORDER 10         // avoid tile-overlap errors
@@ -416,11 +400,6 @@ static void rcd_demosaic(float *const restrict out,
   }
 }
 
-// revert rcd specific aggressive optimizing
-#ifdef __GNUC__
-  #pragma GCC pop_options
-#endif
-
 #ifdef HAVE_OPENCL
 static cl_int process_rcd_cl(dt_iop_module_t *self,
                              dt_dev_pixelpipe_iop_t *piece,
@@ -667,6 +646,10 @@ static gboolean process_rcd_slang(dt_dev_pixelpipe_iop_t *piece,
 #undef w4
 #undef eps
 #undef epssq
+
+#if defined(__GNUC__) && !defined(__clang__)
+  #pragma GCC pop_options
+#endif
 
 // clang-format off
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.py

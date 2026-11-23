@@ -93,6 +93,7 @@ add_iop(monochrome "monochrome.c")
 add_iop(basecurve "basecurve.c" DEFAULT_VISIBLE)
 add_iop(colorzones "colorzones.c")
 add_iop(highlights "highlights.c" DEFAULT_VISIBLE)
+target_compile_options(highlights PRIVATE -fno-fast-math)
 add_iop(overlay "overlay.c")
 add_iop(rawoverexposed "rawoverexposed.c")
 add_iop(velvia "velvia.c")
@@ -114,15 +115,16 @@ add_iop(channelmixer "channelmixer.c")
 add_iop(graduatednd "graduatednd.c")
 add_iop(relight "relight.c")
 add_iop(zonesystem "zonesystem.c")
+
+# Many demosaicers decide by comparing nearly equal floats.
+# Reassociation and fma contraction flip some of those decisions so the CPU
+# code would differ from its OpenCL twin by up to 1e-2 on single photosites.
 add_iop(demosaic "demosaic.c" "demosaicing/amaze.cc" DEFAULT_VISIBLE)
-# AMaZE decides by comparing nearly equal floats. Reassociation and fma
-# contraction flip some of those decisions, so the CPU code would differ
-# from its OpenCL twin (data/kernels/demosaic_amaze.cl) by up to 1e-2 on
-# single pixels. Plain IEEE math costs no measurable time here.
+target_compile_options(demosaic PRIVATE -fno-fast-math)
 if(HAVE_FFP_CONTRACT_OFF)
-  set_source_files_properties("demosaicing/amaze.cc"
-    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+  target_compile_options(demosaic PRIVATE -ffp-contract=off)
 endif()
+
 add_iop(rotatepixels "rotatepixels.c")
 add_iop(scalepixels "scalepixels.c")
 add_iop(atrous "atrous.c")
