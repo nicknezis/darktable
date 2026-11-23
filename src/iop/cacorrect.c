@@ -1824,10 +1824,10 @@ gboolean process_slang(dt_iop_module_t *self,
         && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_filters", hwidth, eheight,
                                      SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt),
                                      SLARG(ewidth), SLARG(eheight), SLARG(hwidth), SLARG(filters))
-        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_tile_sums", 16 * htiles, 16 * vtiles,
+        && !dt_slang_gpu_run_2d_args("cacorrect", "cacorrect_tile_sums", 2 * htiles, vtiles,
                                      SLBUF_DEV(raw), SLBUF_DEV(green), SLBUF_DEV(filt), SLBUF_DEV(tsums),
                                      SLARG(width), SLARG(height), SLARG(hwidth), SLARG(htiles),
-                                     SLARG(filters))
+                                     SLARG(vtiles), SLARG(filters))
         && !dt_slang_gpu_buffer_read(tsums, sums, sizeof(float) * 12 * vtiles * htiles);
       if(!ok) break;
 
