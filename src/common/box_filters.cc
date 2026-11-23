@@ -17,7 +17,7 @@
 */
 
 #ifdef __GNUC__
-#pragma GCC optimize ("finite-math-only", "no-math-errno", "fp-contract=fast", "fast-math")
+#pragma GCC optimize ("finite-math-only", "no-math-errno", "fp-contract=fast")
 #endif
 
 #include <math.h>
