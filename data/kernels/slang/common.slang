@@ -192,28 +192,12 @@ public float fp32_div(float a, float b)
   return fma(r, y, q);
 }
 
-// vector variant of fp32_div(), see fp32_div_4() in ../common.h: one range
-// check for all lanes, and lane by lane only when one of them fails it
+// vector variant of fp32_div(), component by component. fp32_div_4() in
+// ../common.h refines all four lanes at once when every lane passes the range
+// checks; the results are the same, but on Metal that version made diffuse_pde
+// about 20 % slower
 public float4 fp32_div_4(float4 a, float4 b)
 {
-  const float lo = 0x1p-64f;
-  const float hi = 0x1p64f;
-  const float4 aa = abs(a), ab = abs(b);
-
-  if(all(aa >= lo && aa <= hi && ab >= lo && ab <= hi))
-  {
-    float4 y = rcp(b);
-    const float4 e = fma(-b, y, float4(1.0f));
-    y = fma(y, e, y);
-    const float4 q = a * y;
-    const float4 aq = abs(q);
-
-    if(all(abs(e) <= 0x1p-10f && aq >= lo && aq <= hi))
-    {
-      const float4 r = fma(-b, q, a);
-      return fma(r, y, q);
-    }
-  }
   return float4(fp32_div(a.x, b.x), fp32_div(a.y, b.y), fp32_div(a.z, b.z), fp32_div(a.w, b.w));
 }
 
