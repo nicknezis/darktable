@@ -24,7 +24,7 @@ jobs:
       - run: bash -e fetch.sh
       - name: configure with FindONNXRuntime
         run: |
-          mkdir t && cd t
+          mkdir t && ln -s $GITHUB_WORKSPACE/src/src t/src && cd t
           cat > CMakeLists.txt <<'CM'
           cmake_minimum_required(VERSION 3.18)
           project(t C)
