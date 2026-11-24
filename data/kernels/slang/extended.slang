@@ -82,7 +82,7 @@ void colorbalancergb(uint3 gid : SV_DispatchThreadID,
   if(width < 0) out.write(int2(0), float4(profile_info[0].grey, hue_angle, 0.f, 0.f));
   if(x >= width || y >= height) return;
   // we clip pipeline RGB while reading; this also ensures a proper alpha
-  const float4 pix_in = max(float4(0.0f), in.readpixel(x, y));
+  const float4 pix_in = max(float4(0.0f), in.Areadpixel(x, y));
 
   float4 XYZ_D65 = float4(0.f);
   float4 LMS = float4(0.f);

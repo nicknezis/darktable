@@ -181,12 +181,11 @@ public float fp32_div(float a, float b)
 
   float y = rcp(b);
   const float e = fma(-b, y, 1.0f);
-  if(!(abs(e) <= 0x1p-10f))
-    return a / b;
-
   y = fma(y, e, y);
   const float q = a * y;
-  if(!(abs(q) >= lo && abs(q) <= hi))
+
+  if(!(abs(e) <= 0x1p-10f
+     && abs(q) >= lo && abs(q) <= hi))
     return a / b;
 
   const float r = fma(-b, q, a);

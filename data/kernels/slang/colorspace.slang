@@ -808,7 +808,7 @@ public float lookup_gamut(StructuredBuffer<float> gamut_lut, float x)
 {
   // linearly interpolate the gamut LUT at the hue angle in radians, in LUT
   // coordinates
-  const float x_test = (float)LUT_ELEM * (x + M_PI_F) / DT_2PI_F;
+  const float x_test = fp32_div((float)LUT_ELEM * (x + M_PI_F), DT_2PI_F);
 
   // the 2 closest integer coordinates, cycling on the hue ring
   const float x_prev = floor(x_test);
