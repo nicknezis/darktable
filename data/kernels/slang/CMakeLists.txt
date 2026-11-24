@@ -31,9 +31,10 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 # DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
 # kernels whose OpenCL twin sets FP_CONTRACT OFF. Metal fuses a*b+c into an
-# fma by default, even without fast math, and in cacorrect those 1-ulp
-# changes flip the overshoot decisions that the CPU and OpenCL now agree on
-set(DT_SLANG_NO_FP_CONTRACT cacorrect)
+# fma by default, even without fast math, and in these kernels those 1-ulp
+# changes flip decisions that the CPU and OpenCL agree on: the cacorrect
+# overshoot test, AMaZE's direction choices, the spektrafilm grain sampler
+set(DT_SLANG_NO_FP_CONTRACT cacorrect demosaic_amaze spektrafilm)
 
 set(DT_SLANG_OUTPUTS "")
 if(APPLE)
