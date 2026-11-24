@@ -200,24 +200,28 @@ jobs:
           dirname "${slangc}" >> "$GITHUB_PATH"
       - name: Fetch ONNX Runtime
         run: |
-          # the 1.24.4 release that FindONNXRuntime.cmake pins no longer
-          # serves its Linux archives (the download returns 404 and the
-          # releases API call fails), so configure stops at "ONNX Runtime not
-          # found". Fetch a current release against a pinned checksum; the
-          # module finds it in src/external/onnxruntime before it tries to
-          # download, and backend_onnx.c negotiates the API version at runtime
-          ver=1.31.0
+          # GitHub Actions runners get 404 for every microsoft/onnxruntime
+          # release download and releases API call, so FindONNXRuntime.cmake
+          # cannot fetch it and configure stops at "ONNX Runtime not found".
+          # The NuGet package of the version the module pins carries the
+          # Linux libraries and headers too; unpack it into
+          # src/external/onnxruntime, which the module searches first
+          ver=1.24.4
+          sha=4b978d5065b85e7004b6c6f60ca494bd978fbe6836cbf0a0b52d82b61ab99638
           case "${{ runner.arch }}" in
-            X64)   pkg=onnxruntime-linux-x64-${ver}.tgz
-                   sha=cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 ;;
-            ARM64) pkg=onnxruntime-linux-aarch64-${ver}.tgz
-                   sha=c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab ;;
+            X64)   rid=linux-x64 ;;
+            ARM64) rid=linux-arm64 ;;
           esac
-          curl -fsSL --retry 3 -o "${pkg}" "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/${pkg}"
-          echo "${sha}  ${pkg}" | sha256sum -c -
-          mkdir -p src/src/external/onnxruntime
-          tar -xzf "${pkg}" --strip-components=1 -C src/src/external/onnxruntime
-          rm "${pkg}"
+          grep -q "ONNXRUNTIME_VERSION \"${ver}\"" src/cmake/modules/FindONNXRuntime.cmake || {
+            echo "FindONNXRuntime.cmake no longer pins ${ver}: update this step"; exit 1; }
+          curl -fsSL --retry 3 -o ort.nupkg "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/${ver}"
+          echo "${sha}  ort.nupkg" | sha256sum -c -
+          dst=src/src/external/onnxruntime
+          mkdir -p "${dst}/include" "${dst}/lib"
+          unzip -q -j ort.nupkg 'build/native/include/*' -d "${dst}/include"
+          unzip -q -j ort.nupkg "runtimes/${rid}/native/*" -d "${dst}/lib"
+          ls -l "${dst}/lib"
+          rm ort.nupkg
       - name: Build AppImage
         run: |
           cd src
