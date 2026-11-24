@@ -200,20 +200,19 @@ jobs:
           dirname "${slangc}" >> "$GITHUB_PATH"
       - name: Fetch ONNX Runtime
         run: |
-          # FindONNXRuntime.cmake gets the archive checksum from the GitHub
-          # releases API, and that call fails on the runners (with or without
-          # a token), so configure stops at "ONNX Runtime not found". Fetch
-          # the archive here against a pinned checksum instead; the module
-          # finds it in src/external/onnxruntime before trying to download
-          ver=1.24.4
+          # the 1.24.4 release that FindONNXRuntime.cmake pins no longer
+          # serves its Linux archives (the download returns 404 and the
+          # releases API call fails), so configure stops at "ONNX Runtime not
+          # found". Fetch a current release against a pinned checksum; the
+          # module finds it in src/external/onnxruntime before it tries to
+          # download, and backend_onnx.c negotiates the API version at runtime
+          ver=1.31.0
           case "${{ runner.arch }}" in
             X64)   pkg=onnxruntime-linux-x64-${ver}.tgz
-                   sha=3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747 ;;
+                   sha=cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57 ;;
             ARM64) pkg=onnxruntime-linux-aarch64-${ver}.tgz
-                   sha=866109a9248d057671a039b9d725be4bd86888e3754140e6701ec621be9d4d7e ;;
+                   sha=c5b8b3cca31f3d643a3b313b8f42e2d0f16a4fcefd02cda343d97bd5306afaab ;;
           esac
-          grep -q "ONNXRUNTIME_VERSION \"${ver}\"" src/cmake/modules/FindONNXRuntime.cmake || {
-            echo "FindONNXRuntime.cmake no longer pins ${ver}: update this step"; exit 1; }
           curl -fsSL --retry 3 -o "${pkg}" "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/${pkg}"
           echo "${sha}  ${pkg}" | sha256sum -c -
           mkdir -p src/src/external/onnxruntime
