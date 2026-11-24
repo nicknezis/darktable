@@ -18,7 +18,7 @@ jobs:
           for j in w['jobs'].values():
             for s in j.get('steps',[]):
               if s.get('name')=='Fetch ONNX Runtime':
-                open('fetch.sh','w').write(s['run'].replace('${{ runner.arch }}','${RUNNER_ARCH}')); break
+                open('fetch.sh','w').write(s['run'].replace('$'+'{{ runner.arch }}','$'+'{RUNNER_ARCH}')); break
           PY
           cat fetch.sh
       - run: bash -e fetch.sh
