@@ -33,8 +33,9 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 # kernels whose OpenCL twin sets FP_CONTRACT OFF. Metal fuses a*b+c into an
 # fma by default, even without fast math, and in these kernels those 1-ulp
 # changes flip decisions that the CPU and OpenCL agree on: the cacorrect
-# overshoot test, AMaZE's direction choices, the spektrafilm grain sampler
-set(DT_SLANG_NO_FP_CONTRACT cacorrect demosaic_amaze spektrafilm)
+# overshoot test and AMaZE's direction choices. spektrafilm.cl sets it too,
+# but on Metal turning contraction off there made no measurable difference
+set(DT_SLANG_NO_FP_CONTRACT cacorrect demosaic_amaze)
 
 set(DT_SLANG_OUTPUTS "")
 if(APPLE)
