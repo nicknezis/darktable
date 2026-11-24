@@ -9,19 +9,28 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: git clone -q -b nightly-appimage-onnxruntime-nuget --depth 1 https://github.com/${{ github.repository }} src
+      - name: extract fetch step
         run: |
-          set -x
-          for v in 1.24.4 1.31.0; do
-            curl -sS -o /dev/null -w "dl $v x64 %{http_code} %{url_effective}\n" -L "https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-linux-x64-$v.tgz" || true
-            curl -sS -o rel.json -w "api $v %{http_code}\n" "https://api.github.com/repos/microsoft/onnxruntime/releases/tags/v$v" || true
-            head -c 400 rel.json; echo
-            python3 -c "import json;d=json.load(open('rel.json'));[print(a['name'],a.get('digest'),a['browser_download_url']) for a in d.get('assets',[]) if 'linux' in a['name']]" || true
-          done
-          curl -sS -o list.json -w "list %{http_code}\n" "https://api.github.com/repos/microsoft/onnxruntime/releases?per_page=40" || true
-          python3 -c "import json;d=json.load(open('list.json'));[print(r['tag_name'],r['published_at'],len(r['assets'])) for r in d]" || head -c 400 list.json
-          gh release view v1.24.4 -R microsoft/onnxruntime --json assets -q '.assets[].name' || true
-          for v in 1.24.4; do
-            curl -sSL -o ort.nupkg -w "nuget $v %{http_code}\n" "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$v" && sha256sum ort.nupkg && unzip -l ort.nupkg | grep -E "linux|include" | head -20
-          done
+          python3 - <<'PY'
+          import yaml
+          w=yaml.safe_load(open('src/.github/workflows/nightly.yml'))
+          for j in w['jobs'].values():
+            for s in j.get('steps',[]):
+              if s.get('name')=='Fetch ONNX Runtime':
+                open('fetch.sh','w').write(s['run'].replace('${{ runner.arch }}','${RUNNER_ARCH}')); break
+          PY
+          cat fetch.sh
+      - run: bash -e fetch.sh
+      - name: configure with FindONNXRuntime
+        run: |
+          mkdir t && cd t
+          cat > CMakeLists.txt <<'CM'
+          cmake_minimum_required(VERSION 3.18)
+          project(t C)
+          set(CMAKE_SOURCE_DIR_SAVE ${CMAKE_SOURCE_DIR})
+          list(APPEND CMAKE_MODULE_PATH ${SRC}/cmake/modules)
+          find_package(ONNXRuntime REQUIRED)
+          message(STATUS "found=${ONNXRuntime_FOUND} lib=${ONNXRuntime_LIBRARIES} libdir=${ONNXRuntime_LIB_DIR} inc=${ONNXRuntime_INCLUDE_DIRS}")
+          CM
+          cmake -S . -B b -DSRC=$GITHUB_WORKSPACE/src 2>&1 | tail -20
