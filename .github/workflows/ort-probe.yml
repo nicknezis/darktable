@@ -1,0 +1,27 @@
+name: ORT download probe
+on:
+  push:
+    branches: [ci-onnxruntime-download-probe]
+jobs:
+  probe:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          for v in 1.24.4 1.31.0; do
+            curl -sS -o /dev/null -w "dl $v x64 %{http_code} %{url_effective}\n" -L "https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-linux-x64-$v.tgz" || true
+            curl -sS -o rel.json -w "api $v %{http_code}\n" "https://api.github.com/repos/microsoft/onnxruntime/releases/tags/v$v" || true
+            head -c 400 rel.json; echo
+            python3 -c "import json;d=json.load(open('rel.json'));[print(a['name'],a.get('digest'),a['browser_download_url']) for a in d.get('assets',[]) if 'linux' in a['name']]" || true
+          done
+          curl -sS -o list.json -w "list %{http_code}\n" "https://api.github.com/repos/microsoft/onnxruntime/releases?per_page=40" || true
+          python3 -c "import json;d=json.load(open('list.json'));[print(r['tag_name'],r['published_at'],len(r['assets'])) for r in d]" || head -c 400 list.json
+          gh release view v1.24.4 -R microsoft/onnxruntime --json assets -q '.assets[].name' || true
+          for v in 1.24.4; do
+            curl -sSL -o ort.nupkg -w "nuget $v %{http_code}\n" "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime/$v" && sha256sum ort.nupkg && unzip -l ort.nupkg | grep -E "linux|include" | head -20
+          done
