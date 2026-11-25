@@ -357,7 +357,7 @@ float4 _channelmixerrgb(int kind, float4 pix_in, StructuredBuffer<float> RGB_to_
     const int x = gid.x;                                                                               \
     const int y = gid.y;                                                                               \
     if(x >= width || y >= height) return;                                                              \
-    out.write(int2(x, y), _channelmixerrgb(kind, in.read(int2(x, y)), RGB_to_XYZ, XYZ_to_RGB, MIX,     \
+    out.write(int2(x, y), _channelmixerrgb(kind, in.readA(int2(x, y)), RGB_to_XYZ, XYZ_to_RGB, MIX,    \
                                            illuminant, saturation, lightness, grey, p, gamut, clip,    \
                                            apply_grey, version));                                      \
   }
