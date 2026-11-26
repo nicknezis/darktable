@@ -30,15 +30,14 @@ set(DT_SLANG_SPIRV_FLAGS -preserve-params)
 
 # DT_SLANG_METALLIB comes from the probe for Apple's metal compiler in the top CMakeLists.txt
 
-# kernels built without fma contraction on Metal. The OpenCL kernels run with
-# FP_CONTRACT OFF (common.h) unless they turn it on; Metal fuses a*b+c into an
-# fma by default, even without fast math, and in these kernels those 1-ulp
-# changes flip decisions that the CPU and OpenCL agree on: the cacorrect
-# overshoot test and the demosaicers' direction choices. Other kernels keep
-# Metal's default; for spektrafilm turning contraction off made no measurable
-# difference
-set(DT_SLANG_NO_FP_CONTRACT cacorrect capture demosaic_amaze demosaic_lmmse
-    demosaic_markesteijn demosaic_ppg demosaic_rcd demosaic_vng)
+# kernels that keep fma contraction on Metal. Like the OpenCL kernels, which
+# run with FP_CONTRACT OFF (common.h) unless they turn it on, every other
+# kernel is built without it: Metal fuses a*b+c into an fma by default, even
+# without fast math, and those 1-ulp changes move results away from the CPU
+# and OpenCL, or flip decisions they agree on, such as the cacorrect overshoot
+# test and the demosaicers' direction choices. bilateral and filmic match
+# bilateral.cl and filmic.cl, which turn contraction on as their CPU code does
+set(DT_SLANG_FP_CONTRACT bilateral filmic)
 
 set(DT_SLANG_OUTPUTS "")
 if(APPLE)
@@ -80,7 +79,7 @@ foreach(KERNEL IN ITEMS ${DT_SLANG_KERNELS})
       string(REGEX REPLACE "^\\[\\[kernel\\]\\] void ([A-Za-z0-9_]+)\\(.*" "\\1" ENTRY "${ENTRY}")
       set(DT_SLANG_METAL_CONTRACT "")
       set(DT_SLANG_METAL_PRAGMA "")
-      if(KERNAME IN_LIST DT_SLANG_NO_FP_CONTRACT)
+      if(NOT KERNAME IN_LIST DT_SLANG_FP_CONTRACT)
         set(DT_SLANG_METAL_CONTRACT -Xmetal -ffp-contract=off)
         set(DT_SLANG_METAL_PRAGMA COMMAND ${CMAKE_COMMAND} -DFILE=${CMAKE_CURRENT_BINARY_DIR}/${KERNAME}.${ENTRY}.metal
                                   -P ${CMAKE_CURRENT_SOURCE_DIR}/metal_no_fp_contract.cmake)
