@@ -25,7 +25,6 @@ import color_conversion;
 import noise_generator;
 
 static const float FLT_MAX = 3.402823466e+38f;
-static const float INVERSE_SQRT_3 = 0.5773502691896258f;
 
 // dt_iop_filmicrgb_methods_type_t
 static const int DT_FILMIC_METHOD_NONE = 0;

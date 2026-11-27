@@ -32,7 +32,6 @@ static const int DT_ADAPTATION_FULL_BRADFORD   = 2;
 static const int DT_ADAPTATION_XYZ             = 3;
 static const int DT_ADAPTATION_RGB             = 4;
 
-static const float INVERSE_SQRT_3 = 0.5773502691896258f;
 
 float sqf(float x)
 {
@@ -51,8 +50,8 @@ float4 gamut_mapping(float4 input, float compression, int clip)
   const float Y = input.y;
 
   float4 output;
-  float4 xyY = {  sum > 0.0f ? input.x / sum : 0.34567f,
-                  sum > 0.0f ? input.y / sum : 0.35850f,
+  float4 xyY = {  sum > 0.0f ? fp32_div(input.x, sum) : 0.34567f,
+                  sum > 0.0f ? fp32_div(input.y, sum) : 0.35850f,
                   Y,
                   0.0f };
 
@@ -85,8 +84,9 @@ float4 gamut_mapping(float4 input, float compression, int clip)
   // Check sanity of x and y :
   // since Z = Y (1 - x - y) / y, if x + y >= 1, Z will be negative
   const float scale = xyY.x + xyY.y;
-  const bool sanitize = (scale >= 1.f);
-  xyY.xy = sanitize ? xyY.xy / scale : xyY.xy;
+  const bool sanitize = scale >= 1.f;
+  xyY.x = sanitize ? fp32_div(xyY.x, scale) : xyY.x;
+  xyY.y = sanitize ? fp32_div(xyY.y, scale) : xyY.y;
 
   // Convert back to XYZ
   output = dt_xyY_to_XYZ(xyY);
