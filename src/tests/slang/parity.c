@@ -2203,6 +2203,52 @@ static int make_tests(test_t *t)
 #undef CE_BUF
   }
 
+  // color harmonizer: node blending across zone boundaries, and the shifted
+  // chroma capped at the gamut boundary of the new hue
+  {
+    static const float ch_matrix_in[12] = { 0.41f, 0.36f, 0.18f, 0.0f, 0.21f, 0.72f, 0.07f, 0.0f,
+                                            0.02f, 0.12f, 0.95f, 0.0f };
+    static const float ch_matrix_out[12] = { 3.24f, -1.54f, -0.50f, 0.0f, -0.97f, 1.88f, 0.04f, 0.0f,
+                                             0.06f, -0.20f, 1.06f, 0.0f };
+    // the third node sits close enough to the first for their zones to meet
+    static const float ch_nodes[4] = { 0.05f, 0.45f, 0.11f, 0.0f };
+    static const float ch_node_sat[4] = { 1.4f, 0.7f, 1.2f, 1.0f };
+    static float ch_gamut[512];
+    static float ch_jch[4 * W * H], ch_corr[2 * W * H];
+    for(int k = 0; k < 512; k++) ch_gamut[k] = 5.5e-4f + 4e-4f * sinf(k * 0.0245f) + 5e-5f * cosf(k * 0.29f);
+    for(size_t k = 0; k < (size_t)W * H; k++)
+    {
+      const float *px = image_in + 4 * k;
+      ch_jch[4 * k] = 0.02f + 0.9f * fminf(fmaxf(px[0], 0.0f), 1.0f);
+      ch_jch[4 * k + 2] = fminf(fmaxf(px[2], 0.0f), 0.999f);
+      // up to a little past the boundary chroma of the input hue, so the
+      // saturation boost below runs into the cap
+      const float J = ch_jch[4 * k];
+      const float g = powf(ch_gamut[(int)(ch_jch[4 * k + 2] * 512.0f)], 0.6007557f);
+      ch_jch[4 * k + 1] = 1.05f * fminf(fmaxf(px[1], 0.0f), 1.0f) * 15.933f * powf(J, 0.6524f) * g;
+      ch_jch[4 * k + 3] = px[3];
+      ch_corr[2 * k] = 0.2f * (px[3] - 0.5f);
+      ch_corr[2 * k + 1] = 0.8f * (px[0] - 0.4f);
+    }
+    const size_t s2 = sizeof(float) * 2 * W * H, s4 = 2 * s2;
+    // the shift ramps across the 0.01 wide boundary band, so the backends'
+    // atan2() difference in the hue comes out about 100 times larger
+    TEST_TOL("colorharmonizer_map", "colorharmonizer", "colorharmonizer_map", 1e-3,
+             IMG_IN("in", image_in), BUFFER_OUT("p_out", NULL, s2), BUFFER_OUT("jch_out", NULL, s4),
+             INT("width", W), INT("height", H), BUFFER("matrix_in", ch_matrix_in, sizeof(ch_matrix_in)),
+             BUFFER("nodes", ch_nodes, sizeof(ch_nodes)), INT("num_nodes", 3), FLOAT("zone_width", 1.3f),
+             BUFFER("node_saturation", ch_node_sat, sizeof(ch_node_sat)), FLOAT("L_white", 1.0f));
+    // a hue at the +-pi seam is stored as 0 by one backend and as 1 by the other
+    t[n - 1].hue_wrap = 1;
+    // the conversion back goes through pow() and atan2()
+    TEST_TOL("colorharmonizer_apply", "colorharmonizer", "colorharmonizer_apply", 1e-3,
+             IMG_OUT("out"), INT("width", W), INT("height", H),
+             BUFFER("matrix_out", ch_matrix_out, sizeof(ch_matrix_out)), BUFFER("jch_in", ch_jch, s4),
+             BUFFER("corrections", ch_corr, s2), FLOAT("effect_strength", 0.9f),
+             FLOAT("protect_neutral", 0.4f), BUFFER("gamut_LUT", ch_gamut, sizeof(ch_gamut)),
+             FLOAT("L_white", 1.0f));
+  }
+
   // saturation curve, with both formulas, and with and without the guided filter masks
   {
     static const float sc_matrix_in[12] = { 0.31f, 0.58f, 0.11f, 0.0f, 0.18f, 0.71f, 0.11f, 0.0f,

@@ -641,7 +641,7 @@ gboolean process_slang(dt_iop_module_t *self,
                        const dt_iop_roi_t *const roi_in,
                        const dt_iop_roi_t *const roi_out)
 {
-  const dt_iop_colorharmonizer_data_t *const d = piece->data;
+  dt_iop_colorharmonizer_data_t *const d = piece->data;
   const dt_iop_colorharmonizer_params_t *const p = &d->params;
 
   if(piece->colors != 4) return FALSE;
@@ -651,6 +651,7 @@ gboolean process_slang(dt_iop_module_t *self,
 
   const dt_iop_order_iccprofile_info_t *const work_profile = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
   if(!work_profile) return FALSE;
+  _update_gamut_LUT(d, work_profile);
 
   dt_colormatrix_t input_matrix, output_matrix;
   dt_colormatrix_mul(input_matrix, XYZ_D50_to_D65_CAT16, work_profile->matrix_in);
@@ -688,7 +689,7 @@ gboolean process_slang(dt_iop_module_t *self,
                                  SLIMG_DEV(dev_out), SLARG(width), SLARG(height),
                                  SLBUF(output_matrix, sizeof(output_matrix)), SLBUF_DEV(jch),
                                  SLBUF_DEV(corrections), SLARG(pull_strength), SLARG(neutral_protection),
-                                 SLARG(L_white));
+                                 SLBUF(d->gamut_LUT, sizeof(d->gamut_LUT)), SLARG(L_white));
 
   dt_slang_gpu_buffer_free(corrections);
   dt_slang_gpu_buffer_free(jch);
