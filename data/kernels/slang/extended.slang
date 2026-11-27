@@ -567,7 +567,7 @@ float fastlog2(float x)
 float thinplate(float4 x, float4 y)
 {
   const float r2 = (x.x - y.x) * (x.x - y.x) + (x.y - y.y) * (x.y - y.y) + (x.z - y.z) * (x.z - y.z);
-  return r2 * 0.69314718f * fastlog2(max(1e-8f, r2));
+  return r2 * M_LN2f * fastlog2(max(1e-8f, r2));
 }
 
 [shader("compute")]

@@ -58,7 +58,8 @@ public float dt_rgb_norm(float4 in, int norm, int work_profile, ProfileInfo prof
     const float R = in.x * in.x;
     const float G = in.y * in.y;
     const float B = in.z * in.z;
-    return (in.x * R + in.y * G + in.z * B) / (R + G + B);
+    const float sum = R + G + B;
+    return sum != 0.0f ? (in.x * R + in.y * G + in.z * B) / sum : 0.0f;
   }
   else return (in.x + in.y + in.z) / 3.0f;
 }

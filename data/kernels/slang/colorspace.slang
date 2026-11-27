@@ -261,8 +261,8 @@ public float4 dt_xyY_to_uvY(float4 xyY)
   // Use it for "hue preserving" (as much as possible) gamut mapping in scene-referred space
   const float denominator = -2.f * xyY.x + 12.f * xyY.y + 3.f;
   float4 uvY;
-  uvY.x = 4.f * xyY.x / denominator; // u'
-  uvY.y = 9.f * xyY.y / denominator; // v'
+  uvY.x = fp32_div(4.f * xyY.x, denominator); // u'
+  uvY.y = fp32_div(9.f * xyY.y, denominator); // v'
   uvY.z = xyY.z;                     // Y
   uvY.w = xyY.w;
   return uvY;
@@ -278,8 +278,8 @@ public float4 dt_uvY_to_xyY(float4 uvY)
   // Use it for "hue preserving" (as much as possible) gamut mapping in scene-referred space
   const float denominator = 6.0f * uvY.x - 16.f * uvY.y + 12.0f;
   float4 xyY;
-  xyY.x = 9.f * uvY.x / denominator; // x
-  xyY.y = 4.f * uvY.y / denominator; // y
+  xyY.x = fp32_div(9.f * uvY.x, denominator); // x
+  xyY.y = fp32_div(4.f * uvY.y, denominator); // y
   xyY.z = uvY.z;                     // Y
   xyY.w = uvY.w;
   return xyY;
@@ -291,9 +291,9 @@ public float4 dt_xyY_to_XYZ(float4 xyY)
   float4 XYZ = float4(0.0f);
   if(xyY.y != 0.0f)
   {
-    XYZ.x = xyY.z * xyY.x / xyY.y;
+    XYZ.x = fp32_div(xyY.z * xyY.x, xyY.y);
     XYZ.y = xyY.z;
-    XYZ.z = xyY.z * (1.f - xyY.x - xyY.y) / xyY.y;
+    XYZ.z = fp32_div(xyY.z * (1.f - xyY.x - xyY.y), xyY.y);
   }
   XYZ.w = xyY.w;
   return XYZ;
@@ -433,7 +433,7 @@ public float4 XYZ_to_JzAzBz(float4 XYZ_D65)
     const float d_sm = dot(M[2] - M[1], temp1) * 1e-4f;
     const float d_ls = dot(M[0] - M[2], temp1) * 1e-4f;
 
-    const float t_l = dtcl_pow(l, n), t_m = dtcl_pow(m, n), t_s = dtcl_pow(s, n);
+    const float t_l = pow(l, n), t_m = pow(m, n), t_s = pow(s, n);
     const float dt_lm = t_m * dt_expm1(n * dt_log1p(d_lm / m));
     const float dt_sm = t_m * dt_expm1(n * dt_log1p(d_sm / m));
     const float dt_ls = t_s * dt_expm1(n * dt_log1p(d_ls / s));
@@ -453,7 +453,7 @@ public float4 XYZ_to_JzAzBz(float4 XYZ_D65)
     const float d_SM = Mp * dt_expm1(p * dt_log1p(dy_sm / y_m));
     const float d_LS = Sp * dt_expm1(p * dt_log1p(dy_ls / y_s));
 
-    res.x = 0.5f * dtcl_pow(y_l, p) + 0.5f * Mp;
+    res.x = 0.5f * pow(y_l, p) + 0.5f * Mp;
     res.y = 3.524000f * d_LM + 0.542708f * d_SM;
     res.z = 0.199076f * d_LS - 1.096799f * d_SM;
     res.w = 0.f;
