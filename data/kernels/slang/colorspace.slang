@@ -78,7 +78,7 @@ public float4 lab_f(float4 x)
 {
   const float4 epsilon = 216.0f / 24389.0f;
   const float4 kappa = 24389.0f / 27.0f;
-  return select(x > epsilon, dt_cbrt(x), (kappa * x + float4(16.0f)) / float4(116.0f));
+  return select(x > epsilon, dt_cbrt_refined(x), (kappa * x + float4(16.0f)) / float4(116.0f));
 }
 
 public float4 XYZ_to_Lab(float4 xyz)
