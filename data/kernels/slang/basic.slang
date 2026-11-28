@@ -60,8 +60,8 @@ float lerp_lookup_unbounded0(ImageIn lut, float x, StructuredBuffer<float> a, in
       const float f = ft - t;
       const int2 p1 = int2((t & 0xff), (t >> 8));
       const int2 p2 = int2(((t + 1) & 0xff), ((t + 1) >> 8));
-      const float l1 = lut.read(p1).x;
-      const float l2 = lut.read(p2).x;
+      const float l1 = lut.readA(p1).x;
+      const float l2 = lut.readA(p2).x;
       return l1 * (1.0f - f) + l2 * f;
     }
     else return a[3 * c + 1] * dtcl_pow(x * a[3 * c], a[3 * c + 2]);
@@ -2218,7 +2218,7 @@ float _tonecurve_lookup_L(ImageIn lut, float x, StructuredBuffer<float> a)
   if(x < 1.0f / a[0])
   {
     const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
-    return lut.read(int2(xi & 0xff, xi >> 8)).x;
+    return lut.readA(int2(xi & 0xff, xi >> 8)).x;
   }
   return a[1] * dtcl_pow(x * a[0], a[2]);
 }
