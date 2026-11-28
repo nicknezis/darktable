@@ -128,7 +128,7 @@ void toneequal_luminance_mask(uint3 gid : SV_DispatchThreadID,
       const float4 RGB_cubic = RGB_square * value;
       const float numerator = RGB_cubic.x + RGB_cubic.y + RGB_cubic.z;
       const float denominator = RGB_square.x + RGB_square.y + RGB_square.z;
-      lum = exposure_boost * numerator / denominator;
+      lum = denominator != 0.0f ? exposure_boost * numerator / denominator : 0.0f;
       break;
     }
 
@@ -136,7 +136,7 @@ void toneequal_luminance_mask(uint3 gid : SV_DispatchThreadID,
     {
       // geometric_mean(RGB)
       const float product = abs(pixel.x) * abs(pixel.y) * abs(pixel.z);
-      lum = exposure_boost * dtcl_pow(product, 1.0f / 3.0f);
+      lum = exposure_boost * dt_cbrt(product);
       break;
     }
 

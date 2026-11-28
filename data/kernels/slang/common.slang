@@ -29,6 +29,7 @@ public static const float M_PI_2f = 1.57079632679489661923f;
 public static const float M_PI_4f = 0.78539816339744830962f;
 public static const float M_SQRT2_F = 1.41421356237309504880f;
 public static const float DT_2PI_F = 6.28318530717958647693f;
+public static const float INVERSE_SQRT_3 = 0.5773502691896258f;
 
 public static const int LUT_ELEM = 512; // gamut LUT number of elements
 

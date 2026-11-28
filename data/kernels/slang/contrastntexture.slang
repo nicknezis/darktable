@@ -20,7 +20,6 @@
 
 import common;
 
-static const float INVERSE_SQRT_3 = 0.5773502691896258f;
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
