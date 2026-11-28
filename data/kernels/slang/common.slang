@@ -103,6 +103,12 @@ public float dt_cbrt_refined(float x)
   const float residual = fma(-y, y2_err, fma(-y, y2, x));
   return y + residual / (3.0f * y2);
 }
+public vector<float, N> dt_cbrt_refined<let N : int>(vector<float, N> x)
+{
+  vector<float, N> r;
+  for(int k = 0; k < N; k++) r[k] = dt_cbrt_refined(x[k]);
+  return r;
+}
 
 public float dt_fast_hypot(float x, float y) { return dt_hypot(x, y); }
 
