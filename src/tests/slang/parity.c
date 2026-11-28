@@ -2589,7 +2589,7 @@ static int make_tests(test_t *t)
     for(int k = 0; k < (W + 2 * DP_B) * (H + 2 * DP_B); k++) dp_w[k] = image_in[4 * (k % (W * H)) + 2];
     TEST("denoiseprofile_accu", "denoiseprofile", "denoiseprofile_accu",
          IMG_IN("in", dp_pre), BUFFER_OUT("U2", dp_u2, sizeof(dp_u2)), BUFFER("U4", dp_w, sizeof(dp_w)),
-         INT("width", W), INT("height", H), INT2("q", -2, 3), INT("border", DP_B));
+         INT("width", W), INT("height", H), INT2("q", -2, 3), INT("border", DP_B), INT("symmetric", 1));
     TEST("denoiseprofile_finish", "denoiseprofile", "denoiseprofile_finish",
          IMG_IN("in", image_in), BUFFER("U2", dp_u2, sizeof(dp_u2)), IMG_OUT("out"), INT("width", W),
          INT("height", H), FLOAT4("a", 0.012f, 0.011f, 0.013f, 1.0f), FLOAT4("sigma2", 0.002f, 0.003f, 0.001f, 0.0f));

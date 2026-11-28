@@ -186,7 +186,8 @@ void denoiseprofile_vert(uint3 gid : SV_DispatchThreadID,
 void denoiseprofile_accu(uint3 gid : SV_DispatchThreadID,
                          uniform ImageIn in, uniform RWStructuredBuffer<float4> U2,
                          uniform StructuredBuffer<float> U4,
-                         uniform int width, uniform int height, uniform int2 q, uniform int border)
+                         uniform int width, uniform int height, uniform int2 q, uniform int border,
+                         uniform int symmetric)
 {
   const int x = gid.x;
   const int y = gid.y;
@@ -202,7 +203,7 @@ void denoiseprofile_accu(uint3 gid : SV_DispatchThreadID,
   const float u4 = U4[(y + border) * pwidth + x + border];
   const float u4_mq = U4[(y + border - q.y) * pwidth + x + border - q.x];
 
-  const float u4_mq_dd = u4_mq * ddirac(q);
+  const float u4_mq_dd = symmetric != 0 ? u4_mq * ddirac(q) : 0.0f;
 
   float4 accu = (u4 * u1_pq) + (u4_mq_dd * u1_mq);
   accu.w = u4 + u4_mq_dd;

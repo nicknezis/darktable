@@ -2687,6 +2687,8 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
                               + 7.0 * abs_ki * sqrt(abs_kj)) * sign(ki_index)
                              * scattering / 6.0 + ki_index);
       const int q[2] = { i, j };
+      // q and -q are added together, as in process_nlmeans_cl()
+      const int symmetric = 1;
 
       err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_dist", pwidth, pheight,
                                      SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U4), SLARG(width), SLARG(height), SLARG(q),
@@ -2703,7 +2705,7 @@ static int process_nlmeans_slang(dt_iop_module_t *self,
       if(!err)
         err = dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
                                        SLIMG_DEV(dev_tmp), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
-                                       SLARG(width), SLARG(height), SLARG(q), SLARG(border));
+                                       SLARG(width), SLARG(height), SLARG(q), SLARG(border), SLARG(symmetric));
     }
   }
   if(err) goto error;

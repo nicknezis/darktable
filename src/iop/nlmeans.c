@@ -363,6 +363,7 @@ gboolean process_slang(dt_iop_module_t *self,
   const int pwidth = width + 2 * border;
   const int pheight = height + 2 * border;
   const size_t ppixels = (size_t)pwidth * pheight;
+  const int symmetric = 1;
   dt_slang_gpu_buffer_t *dev_U2 = dt_slang_gpu_buffer_new(sizeof(float) * 4 * npixels, NULL);
   dt_slang_gpu_buffer_t *dev_U4 = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
   dt_slang_gpu_buffer_t *dev_U4_t = dt_slang_gpu_buffer_new_uninit(sizeof(float) * ppixels);
@@ -385,7 +386,7 @@ gboolean process_slang(dt_iop_module_t *self,
                                     SLARG(P), SLARG(sharpness))
         || dt_slang_gpu_run_2d_args("denoiseprofile", "denoiseprofile_accu", width, height,
                                     SLIMG_DEV(dev_in), SLBUF_DEV(dev_U2), SLBUF_DEV(dev_U4_tt),
-                                    SLARG(width), SLARG(height), SLARG(q), SLARG(border));
+                                    SLARG(width), SLARG(height), SLARG(q), SLARG(border), SLARG(symmetric));
     }
 
   // normalize and blend
