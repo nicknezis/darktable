@@ -28,7 +28,7 @@ float _lookup_curve(ImageIn lut, float x, float a[3])
   if(x < 1.0f / a[0])
   {
     const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
-    return lut.read(int2(xi & 0xff, xi >> 8)).x;
+    return lut.readA(int2(xi & 0xff, xi >> 8)).x;
   }
   return a[1] * dtcl_pow(x * a[0], a[2]);
 }

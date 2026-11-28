@@ -66,8 +66,8 @@ public float lerp_lookup_unbounded(float x, ImageIn lut, float unbounded_coeffs[
       const float f = ft - t;
       const int2 p1 = int2((t & 0xff), (t >> 8) + n_lut * 256);
       const int2 p2 = int2(((t + 1) & 0xff), ((t + 1) >> 8) + n_lut * 256);
-      const float l1 = lut.read(p1).x;
-      const float l2 = lut.read(p2).x;
+      const float l1 = lut.readA(p1).x;
+      const float l2 = lut.readA(p2).x;
       return l1 * (1.0f - f) + l2 * f;
     }
     else return unbounded_coeffs[1] * dtcl_pow(x*unbounded_coeffs[0], unbounded_coeffs[2]);
@@ -79,7 +79,7 @@ public float lookup(ImageIn lut, float x)
 {
   const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
   const int2 p = int2((xi & 0xff), (xi >> 8));
-  return lut.read(p).x;
+  return lut.readA(p).x;
 }
 
 public float lookup_unbounded(ImageIn lut, float x, float a[3])
@@ -92,7 +92,7 @@ public float lookup_unbounded(ImageIn lut, float x, float a[3])
     {
       const int xi = clamp(int(x * 65536.0f), 0, 0xffff);
       const int2 p = int2((xi & 0xff), (xi >> 8));
-      return lut.read(p).x;
+      return lut.readA(p).x;
     }
     else return a[1] * dtcl_pow(x*a[0], a[2]);
   }
